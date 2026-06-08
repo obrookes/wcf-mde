@@ -49,8 +49,21 @@ adjust the path to wherever you have a checkpoint locally:
 /home/dl18206/projs/Unmarked-Anything/weights/sam3/safari_checkpoint_hf.pt
 ```
 
-`Pi3X.from_pretrained("yyfz233/Pi3X")` downloads weights from Hugging Face on
-first run (only `Pi3X`, not plain `Pi3`, gives metric-scale depth).
+The depth backend is selected with `--depth-model {pi3x,da3}` (default `pi3x`):
+
+- **Pi3X** — `Pi3X.from_pretrained("yyfz233/Pi3X")` downloads weights from
+  Hugging Face on first run (only `Pi3X`, not plain `Pi3`, gives metric-scale
+  depth). Requires `third_party/Pi3` cloned and installed (see above).
+- **Depth Anything 3 (DA3NESTED)** — clone and install similarly:
+  ```bash
+  git clone https://github.com/bytedance-seed/depth-anything-3 third_party/depth_anything_3
+  pip install -e third_party/depth_anything_3
+  ```
+  `DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE-1.1")`
+  downloads weights on first run and outputs metric depth in metres natively
+  (no external camera-intrinsics calibration needed, unlike `DA3METRIC`).
+  Like Pi3X and the SA-FARI checkpoint, it's licensed CC BY-NC 4.0
+  (non-commercial).
 
 ## Running
 
@@ -68,7 +81,9 @@ Useful flags (all have sensible defaults pointing at `data/`):
 | `--device {auto,cpu,cuda}` | compute device (default `auto`) |
 | `--sam3-checkpoint PATH` | SAM-3 checkpoint to load |
 | `--sam3-prompt TEXT` | text prompt for SAM-3 segmentation |
+| `--depth-model {pi3x,da3}` | metric depth backend to evaluate (default `pi3x`) |
 | `--pi3-model-id ID` | Pi3X model id/path (default `yyfz233/Pi3X`) |
+| `--da3-model-id ID` | Depth Anything 3 model id/path (default `depth-anything/DA3NESTED-GIANT-LARGE-1.1`) |
 | `--conf FLOAT` | SAM-3 confidence threshold (default `0.25`) |
 | `--output-csv PATH` | where to write per-row results |
 | `--overlay-dir PATH` | dump frame\|mask\|depth sanity-check PNGs (requires `--limit`) |

@@ -1,12 +1,13 @@
 #!/usr/bin/env python
-"""Evaluate SAM-3 segmentation + Pi3X metric depth against the wcf-mde calibration
+"""Evaluate SAM-3 segmentation + a metric-depth model against the wcf-mde calibration
 ground truth in data/annotations_06052026.csv.
 
 For every annotated row (video_name, frame_idx, frame_timestamp, distance):
   1. resolve video_name -> actual video file under data/ (via list_reference_videos.xlsx)
   2. extract that frame by sequential decode
   3. segment it with SAM-3 (text prompt, default "person holding sign") -> union mask
-  4. estimate metric depth with Pi3X -> per-pixel depth map (metres)
+  4. estimate metric depth with the selected --depth-model (Pi3X or Depth Anything 3 /
+     DA3NESTED, both metric-scale) -> per-pixel depth map (metres)
   5. reduce mask + depth to a single distance estimate (mean-in-mask, centroid)
   6. write predicted vs ground-truth distance to an output CSV, plus a summary
 
@@ -46,7 +47,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data-dir", type=Path, default=REPO_ROOT / "data")
     p.add_argument("--sam3-checkpoint", type=Path, default=DEFAULT_SAM3_CHECKPOINT)
     p.add_argument("--sam3-prompt", type=str, default="person holding sign")
+    p.add_argument("--depth-model", choices=["pi3x", "da3"], default="pi3x",
+                   help="metric depth backend: Pi3X or Depth Anything 3 (DA3NESTED, metres-native)")
     p.add_argument("--pi3-model-id", type=str, default="yyfz233/Pi3X")
+    p.add_argument("--da3-model-id", type=str, default="depth-anything/DA3NESTED-GIANT-LARGE-1.1")
     p.add_argument("--output-csv", type=Path, default=REPO_ROOT / "outputs" / "calibration_results.csv")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--conf", type=float, default=0.25)
@@ -106,6 +110,20 @@ def run_pi3x_depth(model, frame_bgr: np.ndarray, device: torch.device) -> np.nda
     # local_points = concat([xy * z, z]); z is the per-pixel metric depth (camera-local Z).
     depth = res["local_points"][0, 0, :, :, 2].detach().cpu().numpy().astype(np.float32)
     return depth
+
+
+# --------------------------------------------------------------------------------------
+# Depth Anything 3 (DA3NESTED) depth -- outputs metric depth in metres natively, no
+# external camera-intrinsics calibration needed (unlike DA3METRIC, which would require
+# focal lengths we don't have for these camera-trap rigs).
+# --------------------------------------------------------------------------------------
+
+def run_da3_depth(model, frame_bgr: np.ndarray, device: torch.device) -> np.ndarray:
+    """Single-frame metric depth map (H, W) in metres, at the model's working resolution."""
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    with torch.no_grad():
+        prediction = model.inference([rgb])
+    return prediction.depth[0].astype(np.float32)
 
 
 # --------------------------------------------------------------------------------------
@@ -271,7 +289,7 @@ def _maybe_save_overlay(
 
 def process_frame(
     sam3,
-    pi3,
+    depth_fn,
     frame_bgr: np.ndarray | None,
     prompt: str,
     device: torch.device,
@@ -305,7 +323,7 @@ def process_frame(
         return result
 
     try:
-        depth = run_pi3x_depth(pi3, frame_bgr, device)
+        depth = depth_fn(frame_bgr)
         depth = _resize_depth_to(depth, frame_shape_hw)
         depth_mask_mean = compute_depth_mask_mean(depth, union_mask)
         depth_centroid = compute_depth_centroid(depth, center_xy)
@@ -330,6 +348,7 @@ OUTPUT_FIELDS = [
     "frame_idx",
     "frame_timestamp",
     "distance_gt",
+    "depth_model",
     "status",
     "mask_area_px",
     "depth_mask_mean",
@@ -372,6 +391,7 @@ def main() -> None:
                 "frame_idx": row["frame_idx"],
                 "frame_timestamp": row["frame_timestamp"],
                 "distance_gt": row["distance_gt"],
+                "depth_model": args.depth_model,
                 "status": "video_missing",
                 "mask_area_px": None,
                 "depth_mask_mean": None,
@@ -398,10 +418,18 @@ def main() -> None:
     )
     sam3 = SAM3SemanticPredictor(overrides=sam3_overrides)
 
-    print(f"loading Pi3X ({args.pi3_model_id}) ...")
-    from pi3.models.pi3x import Pi3X
+    if args.depth_model == "pi3x":
+        print(f"loading Pi3X ({args.pi3_model_id}) ...")
+        from pi3.models.pi3x import Pi3X
 
-    pi3 = Pi3X.from_pretrained(args.pi3_model_id).to(device).eval()
+        depth_model = Pi3X.from_pretrained(args.pi3_model_id).to(device).eval()
+        depth_fn = lambda frame: run_pi3x_depth(depth_model, frame, device)
+    else:
+        print(f"loading Depth Anything 3 ({args.da3_model_id}) ...")
+        from depth_anything_3.api import DepthAnything3
+
+        depth_model = DepthAnything3.from_pretrained(args.da3_model_id).to(device).eval()
+        depth_fn = lambda frame: run_da3_depth(depth_model, frame, device)
 
     def row_dict(i: int, fields: dict) -> dict:
         row = rows[i]
@@ -410,6 +438,7 @@ def main() -> None:
             "frame_idx": row["frame_idx"],
             "frame_timestamp": row["frame_timestamp"],
             "distance_gt": row["distance_gt"],
+            "depth_model": args.depth_model,
             **fields,
         }
 
@@ -432,7 +461,7 @@ def main() -> None:
                     }
                     overlay_path = args.overlay_dir / f"{video_path.stem}_frame{frame_idx:06d}.png"
 
-                frame_fields = process_frame(sam3, pi3, frame_bgr, args.sam3_prompt, device,
+                frame_fields = process_frame(sam3, depth_fn, frame_bgr, args.sam3_prompt, device,
                                              overlay_path=overlay_path, overlay_meta=overlay_meta)
                 for i in idx_to_row_indices[frame_idx]:
                     results[i] = row_dict(i, frame_fields)
