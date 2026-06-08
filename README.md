@@ -71,5 +71,24 @@ Useful flags (all have sensible defaults pointing at `data/`):
 | `--pi3-model-id ID` | Pi3X model id/path (default `yyfz233/Pi3X`) |
 | `--conf FLOAT` | SAM-3 confidence threshold (default `0.25`) |
 | `--output-csv PATH` | where to write per-row results |
+| `--overlay-dir PATH` | dump frame\|mask\|depth sanity-check PNGs (requires `--limit`) |
 
 Run `python scripts/run_calibration_eval.py --help` for the full list.
+
+### Qualitatively checking outputs
+
+For a small smoke-test run, pass `--overlay-dir` (it requires `--limit`, since
+dumping a PNG per frame is only meant for spot-checks, not full runs):
+
+```bash
+python scripts/run_calibration_eval.py --device cuda --limit 20 \
+  --output-csv outputs/smoke_results.csv --overlay-dir outputs/overlays
+```
+
+Each PNG is named `<video_stem>_frame<NNNNNN>.png` and shows the decoded
+frame (with the SAM-3 mask outline + bbox-center marker) beside a colourised
+depth map, annotated with `status`, `mask_area_px`, `depth_mask_mean`,
+`depth_centroid`, and `distance_gt`. The frame index burned into the image is
+the one the script itself decoded (`iter_frames_at_indices`'s loop counter),
+not a value re-read from the CSV — comparing it against the visible frame
+content is a direct check that the correct frame was extracted.

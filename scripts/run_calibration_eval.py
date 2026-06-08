@@ -51,7 +51,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--conf", type=float, default=0.25)
     p.add_argument("--limit", type=int, default=None, help="process at most this many CSV rows (for smoke-testing)")
-    return p.parse_args()
+    p.add_argument(
+        "--overlay-dir",
+        type=Path,
+        default=None,
+        help="dump a frame|mask|depth sanity-check PNG per processed frame here "
+             "(labelled with the script-decoded frame index; requires --limit)",
+    )
+    args = p.parse_args()
+    if args.overlay_dir is not None and args.limit is None:
+        p.error("--overlay-dir requires --limit (it's a sanity-check aid for small smoke-test runs only)")
+    return args
 
 
 def resolve_device(device_arg: str) -> torch.device:
@@ -163,6 +173,76 @@ def compute_depth_centroid(depth: np.ndarray, center_xy: tuple[int, int] | None)
 
 
 # --------------------------------------------------------------------------------------
+# overlay dumps: frame | mask outline + centroid | depth colormap, for visually
+# sanity-checking frame extraction, segmentation, and depth on a small (--limit'ed) run.
+# --------------------------------------------------------------------------------------
+
+def save_overlay(
+    out_path: Path,
+    frame_bgr: np.ndarray,
+    meta: dict,
+    union_mask: np.ndarray | None,
+    center_xy: tuple[int, int] | None,
+    depth: np.ndarray | None,
+    fields: dict,
+) -> None:
+    """Write a frame|mask|depth panel labelled with the *script-decoded* frame index
+    (`meta["frame_idx"]`, the iter_frames_at_indices loop counter) rather than a value
+    re-read from the CSV row, so the image itself can confirm the correct frame was
+    extracted, independent of any row/CSV bookkeeping."""
+    annotated = frame_bgr.copy()
+    if union_mask is not None:
+        contours, _ = cv2.findContours(union_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(annotated, contours, -1, (0, 255, 0), 2)
+    if center_xy is not None:
+        cv2.drawMarker(annotated, center_xy, (0, 0, 255), markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
+
+    if depth is not None and np.isfinite(depth).any():
+        finite = depth[np.isfinite(depth)]
+        d_min, d_max = float(finite.min()), float(finite.max())
+        norm = np.clip((depth - d_min) / max(d_max - d_min, 1e-6), 0.0, 1.0)
+        depth_vis = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+    else:
+        depth_vis = np.zeros_like(frame_bgr)
+
+    panel = cv2.hconcat([annotated, depth_vis])
+
+    lines = [
+        f"video={meta['video_name']}",
+        f"frame_idx (script-decoded)={meta['frame_idx']}",
+        f"status={fields['status']}",
+        f"mask_area_px={fields['mask_area_px']}",
+        f"depth_mask_mean={fields['depth_mask_mean']}",
+        f"depth_centroid={fields['depth_centroid']}",
+        f"distance_gt={meta['distance_gt']}",
+    ]
+    for n, line in enumerate(lines):
+        org = (10, 25 + 22 * n)
+        cv2.putText(panel, line, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(panel, line, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out_path), panel)
+
+
+def _maybe_save_overlay(
+    overlay_path: Path | None,
+    meta: dict | None,
+    frame_bgr: np.ndarray | None,
+    fields: dict,
+    union_mask: np.ndarray | None = None,
+    center_xy: tuple[int, int] | None = None,
+    depth: np.ndarray | None = None,
+) -> None:
+    if overlay_path is None or frame_bgr is None:
+        return
+    try:
+        save_overlay(overlay_path, frame_bgr, meta, union_mask, center_xy, depth, fields)
+    except Exception as exc:  # noqa: BLE001 - overlay dumping must never break the run
+        print(f"  !! failed to write overlay {overlay_path}: {exc}")
+
+
+# --------------------------------------------------------------------------------------
 # per-frame pipeline: decoded frame -> {status, mask_area_px, depth_mask_mean, depth_centroid}
 #
 # Run once per decoded frame (not once per annotation row): multiple CSV rows can reference
@@ -171,23 +251,40 @@ def compute_depth_centroid(depth: np.ndarray, center_xy: tuple[int, int] | None)
 # shares the frame.
 # --------------------------------------------------------------------------------------
 
-def process_frame(sam3, pi3, frame_bgr: np.ndarray | None, prompt: str, device: torch.device) -> dict:
+def process_frame(
+    sam3,
+    pi3,
+    frame_bgr: np.ndarray | None,
+    prompt: str,
+    device: torch.device,
+    overlay_path: Path | None = None,
+    overlay_meta: dict | None = None,
+) -> dict:
     if frame_bgr is None:
-        return {"status": "frame_decode_error", "mask_area_px": None,
-                "depth_mask_mean": None, "depth_centroid": None}
+        result = {"status": "frame_decode_error", "mask_area_px": None,
+                  "depth_mask_mean": None, "depth_centroid": None}
+        _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result)
+        return result
 
     frame_shape_hw = frame_bgr.shape[:2]
+    union_mask: np.ndarray | None = None
+    center_xy: tuple[int, int] | None = None
+    depth: np.ndarray | None = None
 
     try:
         sam_results = sam3(source=frame_bgr, text=[prompt])
         union_mask, center_xy, mask_area_px = extract_union_mask(sam_results[0], frame_shape_hw)
     except Exception as exc:  # noqa: BLE001 - record and continue
-        return {"status": f"sam_error: {exc}", "mask_area_px": None,
-                "depth_mask_mean": None, "depth_centroid": None}
+        result = {"status": f"sam_error: {exc}", "mask_area_px": None,
+                  "depth_mask_mean": None, "depth_centroid": None}
+        _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth)
+        return result
 
     if mask_area_px == 0:
-        return {"status": "empty_mask", "mask_area_px": 0,
-                "depth_mask_mean": None, "depth_centroid": None}
+        result = {"status": "empty_mask", "mask_area_px": 0,
+                  "depth_mask_mean": None, "depth_centroid": None}
+        _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth)
+        return result
 
     try:
         depth = run_pi3x_depth(pi3, frame_bgr, device)
@@ -195,11 +292,15 @@ def process_frame(sam3, pi3, frame_bgr: np.ndarray | None, prompt: str, device: 
         depth_mask_mean = compute_depth_mask_mean(depth, union_mask)
         depth_centroid = compute_depth_centroid(depth, center_xy)
     except Exception as exc:  # noqa: BLE001
-        return {"status": f"depth_error: {exc}", "mask_area_px": mask_area_px,
-                "depth_mask_mean": None, "depth_centroid": None}
+        result = {"status": f"depth_error: {exc}", "mask_area_px": mask_area_px,
+                  "depth_mask_mean": None, "depth_centroid": None}
+        _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth)
+        return result
 
-    return {"status": "processed", "mask_area_px": mask_area_px,
-            "depth_mask_mean": depth_mask_mean, "depth_centroid": depth_centroid}
+    result = {"status": "processed", "mask_area_px": mask_area_px,
+              "depth_mask_mean": depth_mask_mean, "depth_centroid": depth_centroid}
+    _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth)
+    return result
 
 
 # --------------------------------------------------------------------------------------
@@ -303,7 +404,18 @@ def main() -> None:
 
         try:
             for frame_idx, frame_bgr in iter_frames_at_indices(video_path, frame_indices):
-                frame_fields = process_frame(sam3, pi3, frame_bgr, args.sam3_prompt, device)
+                overlay_path = overlay_meta = None
+                if args.overlay_dir is not None:
+                    first_row = rows[idx_to_row_indices[frame_idx][0]]
+                    overlay_meta = {
+                        "frame_idx": frame_idx,  # script-decoded index, not the CSV's
+                        "video_name": first_row["video_name"],
+                        "distance_gt": first_row["distance_gt"],
+                    }
+                    overlay_path = args.overlay_dir / f"{video_path.stem}_frame{frame_idx:06d}.png"
+
+                frame_fields = process_frame(sam3, pi3, frame_bgr, args.sam3_prompt, device,
+                                             overlay_path=overlay_path, overlay_meta=overlay_meta)
                 for i in idx_to_row_indices[frame_idx]:
                     results[i] = row_dict(i, frame_fields)
 
