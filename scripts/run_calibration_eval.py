@@ -123,7 +123,12 @@ def run_da3_depth(model, frame_bgr: np.ndarray, device: torch.device) -> np.ndar
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     with torch.no_grad():
         prediction = model.inference([rgb])
-    return prediction.depth[0].astype(np.float32)
+    # squeeze defensively: depth is documented as [N, H, W] for N input images, but a
+    # stray singleton channel dim ([N, 1, H, W] or [N, H, W, 1]) would otherwise slip
+    # through here and break the (H, W) contract downstream (_resize_depth_to, mask indexing).
+    depth = np.asarray(prediction.depth[0], dtype=np.float32).squeeze()
+    assert depth.ndim == 2, f"expected (H, W) depth map from DA3, got shape {depth.shape}"
+    return depth
 
 
 # --------------------------------------------------------------------------------------
