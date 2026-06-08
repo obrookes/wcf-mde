@@ -87,8 +87,8 @@ python scripts/run_calibration_eval.py --device cuda --limit 20 \
 
 Each PNG is named `<video_stem>_frame<NNNNNN>.png` and shows the decoded
 frame (with the SAM-3 mask outline + bbox-center marker) beside a colourised
-depth map, annotated with `status`, `mask_area_px`, `depth_mask_mean`,
-`depth_centroid`, and `distance_gt`. The frame index burned into the image is
+depth map with a metres-labelled scale bar, annotated with `status`,
+`mask_area_px`, `depth_mask_mean`, `depth_centroid`, and `distance_gt`. The frame index burned into the image is
 the one the script itself decoded (`iter_frames_at_indices`'s loop counter),
 not a value re-read from the CSV — comparing it against the visible frame
 content is a direct check that the correct frame was extracted.

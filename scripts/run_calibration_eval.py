@@ -177,6 +177,23 @@ def compute_depth_centroid(depth: np.ndarray, center_xy: tuple[int, int] | None)
 # sanity-checking frame extraction, segmentation, and depth on a small (--limit'ed) run.
 # --------------------------------------------------------------------------------------
 
+DEPTH_COLORMAP = cv2.COLORMAP_TURBO
+
+
+def make_depth_colorbar(height: int, d_min: float, d_max: float, bar_width: int = 30, label_width: int = 80) -> np.ndarray:
+    """Vertical scale bar (max at top, min at bottom) in DEPTH_COLORMAP, labelled
+    with the metric depth range (metres) it represents."""
+    gradient = np.linspace(255, 0, height, dtype=np.uint8).reshape(-1, 1)
+    bar = cv2.applyColorMap(np.repeat(gradient, bar_width, axis=1), DEPTH_COLORMAP)
+
+    canvas = np.zeros((height, bar_width + label_width, 3), dtype=np.uint8)
+    canvas[:, :bar_width] = bar
+    for value, y in ((d_max, 15), (d_min, height - 8)):
+        cv2.putText(canvas, f"{value:.2f}m", (bar_width + 4, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    return canvas
+
+
 def save_overlay(
     out_path: Path,
     frame_bgr: np.ndarray,
@@ -201,11 +218,12 @@ def save_overlay(
         finite = depth[np.isfinite(depth)]
         d_min, d_max = float(finite.min()), float(finite.max())
         norm = np.clip((depth - d_min) / max(d_max - d_min, 1e-6), 0.0, 1.0)
-        depth_vis = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+        depth_vis = cv2.applyColorMap((norm * 255).astype(np.uint8), DEPTH_COLORMAP)
+        depth_panel = cv2.hconcat([depth_vis, make_depth_colorbar(depth_vis.shape[0], d_min, d_max)])
     else:
-        depth_vis = np.zeros_like(frame_bgr)
+        depth_panel = np.zeros_like(frame_bgr)
 
-    panel = cv2.hconcat([annotated, depth_vis])
+    panel = cv2.hconcat([annotated, depth_panel])
 
     lines = [
         f"video={meta['video_name']}",
