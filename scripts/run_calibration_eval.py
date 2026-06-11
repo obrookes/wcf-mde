@@ -4,11 +4,12 @@ ground truth in data/annotations_06052026.csv.
 
 For every annotated row (video_name, frame_idx, frame_timestamp, distance):
   1. resolve video_name -> actual video file under data/ (via list_reference_videos.xlsx)
-  2. extract that frame by sequential decode
-  3. segment it with SAM-3 (text prompt, default "person holding sign") -> union mask
-  4. estimate metric depth with the selected --depth-model (Pi3X or Depth Anything 3 /
-     DA3NESTED, both metric-scale) -> per-pixel depth map (metres)
-  5. reduce mask + depth to a single distance estimate (mean-in-mask, centroid)
+  2. extract all annotated frames for that video by sequential decode
+  3. estimate metric depth jointly across all annotated frames in one inference call
+     (both Pi3X and DA3NESTED are multi-view architectures; joint inference gives better
+     metric scale than processing each frame independently)
+  4. segment each frame with SAM-3 (text prompt, default "person holding sign") -> union mask
+  5. reduce mask + precomputed depth to a single distance estimate (mean-in-mask, centroid)
   6. write predicted vs ground-truth distance to an output CSV, plus a summary
 
 Patterns for SAM-3 invocation, mask extraction, and mask->depth reduction are adapted
@@ -101,15 +102,28 @@ def frame_to_pi3_tensor(frame_bgr: np.ndarray) -> torch.Tensor:
     return transforms.ToTensor()(resized)
 
 
-def run_pi3x_depth(model, frame_bgr: np.ndarray, device: torch.device) -> np.ndarray:
-    """Single-frame metric depth map (H, W) in metres, at the model's working resolution."""
-    tensor = frame_to_pi3_tensor(frame_bgr).to(device)
-    imgs = tensor.unsqueeze(0).unsqueeze(0)  # (B=1, N=1, 3, H, W)
+def run_pi3x_depth_batch(model, frames_bgr: list[np.ndarray], device: torch.device) -> list[np.ndarray]:
+    """Joint metric depth inference over N frames from the same video.
+
+    Pi3X is a multi-view architecture: odd decoder blocks apply cross-frame attention and
+    metric scale is estimated from relative camera motion — both require N > 1 to be effective.
+    All frames are resized to the same (target_h, target_w) grid derived from the first frame
+    so they can be stacked into a single (1, N, 3, H, W) tensor.
+    """
+    # derive target size from first frame; apply to all so the stack is shape-consistent
+    ref_tensor = frame_to_pi3_tensor(frames_bgr[0])
+    _, h, w = ref_tensor.shape
+    tensors = [ref_tensor]
+    for f in frames_bgr[1:]:
+        rgb = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb).resize((w, h))
+        tensors.append(transforms.ToTensor()(pil))
+    imgs = torch.stack(tensors).unsqueeze(0).to(device)  # (1, N, 3, H, W)
     with torch.no_grad():
         res = model(imgs)
-    # local_points = concat([xy * z, z]); z is the per-pixel metric depth (camera-local Z).
-    depth = res["local_points"][0, 0, :, :, 2].detach().cpu().numpy().astype(np.float32)
-    return depth
+    # local_points[..., 2] is per-pixel metric Z-depth; shape (1, N, H, W)
+    depths = res["local_points"][0, :, :, :, 2].detach().cpu().numpy().astype(np.float32)
+    return [depths[i] for i in range(depths.shape[0])]
 
 
 # --------------------------------------------------------------------------------------
@@ -118,17 +132,20 @@ def run_pi3x_depth(model, frame_bgr: np.ndarray, device: torch.device) -> np.nda
 # focal lengths we don't have for these camera-trap rigs).
 # --------------------------------------------------------------------------------------
 
-def run_da3_depth(model, frame_bgr: np.ndarray, device: torch.device) -> np.ndarray:
-    """Single-frame metric depth map (H, W) in metres, at the model's working resolution."""
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+def run_da3_depth_batch(model, frames_bgr: list[np.ndarray], device: torch.device) -> list[np.ndarray]:
+    """Joint metric depth inference over N frames from the same video.
+
+    DA3NESTED applies cross-view attention and reference-view selection when N > 2, giving
+    better metric scale than single-frame inference. Frames should be in temporal order.
+    Returns one (H, W) float32 depth map per input frame, in metres.
+    """
+    rgbs = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames_bgr]
     with torch.no_grad():
-        prediction = model.inference([rgb])
-    # squeeze defensively: depth is documented as [N, H, W] for N input images, but a
-    # stray singleton channel dim ([N, 1, H, W] or [N, H, W, 1]) would otherwise slip
-    # through here and break the (H, W) contract downstream (_resize_depth_to, mask indexing).
-    depth = np.asarray(prediction.depth[0], dtype=np.float32).squeeze()
-    assert depth.ndim == 2, f"expected (H, W) depth map from DA3, got shape {depth.shape}"
-    return depth
+        prediction = model.inference(rgbs)
+    # prediction.depth: (N, H, W) — one map per input frame
+    depths = np.asarray(prediction.depth, dtype=np.float32)
+    assert depths.ndim == 3, f"expected (N, H, W) from DA3 batch inference, got {depths.shape}"
+    return [depths[i].squeeze() for i in range(depths.shape[0])]
 
 
 # --------------------------------------------------------------------------------------
@@ -294,8 +311,8 @@ def _maybe_save_overlay(
 
 def process_frame(
     sam3,
-    depth_fn,
     frame_bgr: np.ndarray | None,
+    depth: np.ndarray | None,
     prompt: str,
     device: torch.device,
     overlay_path: Path | None = None,
@@ -310,7 +327,6 @@ def process_frame(
     frame_shape_hw = frame_bgr.shape[:2]
     union_mask: np.ndarray | None = None
     center_xy: tuple[int, int] | None = None
-    depth: np.ndarray | None = None
 
     try:
         sam_results = sam3(source=frame_bgr, text=[prompt])
@@ -327,11 +343,16 @@ def process_frame(
         _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth)
         return result
 
+    if depth is None:
+        result = {"status": "depth_error: no depth map (inference failed for this video)",
+                  "mask_area_px": mask_area_px, "depth_mask_mean": None, "depth_centroid": None}
+        _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth)
+        return result
+
     try:
-        depth = depth_fn(frame_bgr)
-        depth = _resize_depth_to(depth, frame_shape_hw)
-        depth_mask_mean = compute_depth_mask_mean(depth, union_mask)
-        depth_centroid = compute_depth_centroid(depth, center_xy)
+        depth_resized = _resize_depth_to(depth, frame_shape_hw)
+        depth_mask_mean = compute_depth_mask_mean(depth_resized, union_mask)
+        depth_centroid = compute_depth_centroid(depth_resized, center_xy)
     except Exception as exc:  # noqa: BLE001
         result = {"status": f"depth_error: {exc}", "mask_area_px": mask_area_px,
                   "depth_mask_mean": None, "depth_centroid": None}
@@ -340,7 +361,7 @@ def process_frame(
 
     result = {"status": "processed", "mask_area_px": mask_area_px,
               "depth_mask_mean": depth_mask_mean, "depth_centroid": depth_centroid}
-    _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth)
+    _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth_resized)
     return result
 
 
@@ -428,13 +449,13 @@ def main() -> None:
         from pi3.models.pi3x import Pi3X
 
         depth_model = Pi3X.from_pretrained(args.pi3_model_id).to(device).eval()
-        depth_fn = lambda frame: run_pi3x_depth(depth_model, frame, device)
+        depth_fn = lambda frames: run_pi3x_depth_batch(depth_model, frames, device)
     else:
         print(f"loading Depth Anything 3 ({args.da3_model_id}) ...")
         from depth_anything_3.api import DepthAnything3
 
         depth_model = DepthAnything3.from_pretrained(args.da3_model_id).to(device).eval()
-        depth_fn = lambda frame: run_da3_depth(depth_model, frame, device)
+        depth_fn = lambda frames: run_da3_depth_batch(depth_model, frames, device)
 
     def row_dict(i: int, fields: dict) -> dict:
         row = rows[i]
@@ -455,7 +476,20 @@ def main() -> None:
             idx_to_row_indices[rows[i]["frame_idx"]].append(i)
 
         try:
-            for frame_idx, frame_bgr in iter_frames_at_indices(video_path, frame_indices):
+            # decode all annotated frames for this video (max 16 in this dataset)
+            frames_buffer = list(iter_frames_at_indices(video_path, frame_indices))
+
+            # single joint depth inference over all frames — both Pi3X and DA3NESTED are
+            # multi-view architectures that give better metric scale with N > 1
+            all_frames_bgr = [bgr for _, bgr in frames_buffer]
+            try:
+                all_depths = depth_fn(all_frames_bgr)
+            except Exception as exc:  # noqa: BLE001 - depth failure shouldn't abort the video
+                print(f"  !! depth inference failed for {video_path}: {exc}")
+                all_depths = [None] * len(frames_buffer)
+            depth_by_idx = {fid: d for (fid, _), d in zip(frames_buffer, all_depths)}
+
+            for frame_idx, frame_bgr in frames_buffer:
                 overlay_path = overlay_meta = None
                 if args.overlay_dir is not None:
                     first_row = rows[idx_to_row_indices[frame_idx][0]]
@@ -466,8 +500,11 @@ def main() -> None:
                     }
                     overlay_path = args.overlay_dir / f"{video_path.stem}_frame{frame_idx:06d}.png"
 
-                frame_fields = process_frame(sam3, depth_fn, frame_bgr, args.sam3_prompt, device,
-                                             overlay_path=overlay_path, overlay_meta=overlay_meta)
+                frame_fields = process_frame(
+                    sam3, frame_bgr, depth_by_idx.get(frame_idx),
+                    args.sam3_prompt, device,
+                    overlay_path=overlay_path, overlay_meta=overlay_meta,
+                )
                 for i in idx_to_row_indices[frame_idx]:
                     results[i] = row_dict(i, frame_fields)
 

@@ -7,17 +7,22 @@ estimation against that ground truth. See `CLAUDE.md` for the dataset layout.
 ## Pipeline
 
 `scripts/run_calibration_eval.py` walks `data/annotations_06052026.csv`, and
-for each annotated row:
+for each video that has annotated frames:
 
 1. resolves `video_name` to an actual video file under `data/` (via
    `data/list_reference_videos.xlsx`, see `scripts/video_lookup.py`)
-2. extracts the annotated frame by sequential decode (`scripts/frame_source.py`)
-3. segments it with **SAM-3** using a text prompt (default `"person holding sign"`)
-4. estimates per-pixel metric depth with **Pi3X**
+2. extracts **all** annotated frames for that video by sequential decode
+   (`scripts/frame_source.py`)
+3. estimates per-pixel metric depth **jointly** across all annotated frames in
+   one inference call — both Pi3X and DA3NESTED are multi-view architectures
+   whose cross-frame attention and scale estimation improve with N > 1
+   (this dataset has a maximum of 16 annotated frames per video, median 6)
+4. segments each frame with **SAM-3** using a text prompt (default
+   `"person holding sign"`)
 5. reduces mask + depth to a single predicted distance (mean-in-mask, centroid)
 
-and writes `video_name, frame_idx, frame_timestamp, distance_gt, status,
-mask_area_px, depth_mask_mean, depth_centroid` to an output CSV, plus a
+and writes `video_name, frame_idx, frame_timestamp, distance_gt, depth_model,
+status, mask_area_px, depth_mask_mean, depth_centroid` to an output CSV, plus a
 summary (status counts, MAE/RMSE/bias vs. ground truth) at the end.
 
 ## Environment setup
