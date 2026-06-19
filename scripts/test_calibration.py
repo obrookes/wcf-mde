@@ -65,6 +65,20 @@ def test_apply_preserves_invalid_pixels():
     assert out[2, 1] == np.float32(9.0)   # 2*4+1
 
 
+def test_apply_marks_nonphysical_extrapolation_invalid():
+    # fit a decreasing transform so near pixels extrapolate to negative "distance"
+    cal = fit_calibration(np.array([3.0, 4.0, 5.0]), np.array([5.0, 4.0, 3.0]), "linear")  # a<0
+    m = np.array([[4.0, 100.0]], dtype=np.float32)  # 4 -> ~4m (ok); 100 -> negative -> NaN
+    out = cal.apply(m)
+    assert out[0, 0] > 0 and np.isfinite(out[0, 0])
+    assert np.isnan(out[0, 1])  # non-physical extrapolation marked invalid, not written
+
+
+def test_poly_single_point_falls_back():
+    cal = fit_calibration(np.array([4.0]), np.array([8.0]), "poly", degree=2)
+    assert abs(float(cal.predict(np.array([4.0]))[0]) - 8.0) < 1e-9  # scale through the point
+
+
 def test_leave_one_out_beats_uncalibrated():
     d = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
     gt = 2.0 * d + 1.0  # perfectly affine -> LOO calibrated error ~0

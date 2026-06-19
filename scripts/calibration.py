@@ -66,7 +66,13 @@ class Calibrator:
         else:
             pred = self.predict(d[valid])
 
-        out[valid] = np.asarray(pred, dtype=np.float32)
+        # The transform is fit on the subject's (narrow) depth range; extrapolating it to
+        # pixels far outside that range (sky, far background, near foreground) can yield
+        # non-physical distances (negative, or exploding for disparity/poly). Mark those
+        # invalid (NaN) rather than writing a misleading number into the calibrated map.
+        pred = np.asarray(pred, dtype=np.float32)
+        pred = np.where(np.isfinite(pred) & (pred > 0), pred, np.float32(np.nan))
+        out[valid] = pred
         return out
 
     def __repr__(self) -> str:
@@ -162,6 +168,8 @@ class PolyCalibrator(Calibrator):
 
     @classmethod
     def fit(cls, pred: np.ndarray, gt: np.ndarray, degree: int = 2) -> "PolyCalibrator":
+        if pred.size == 1:  # underdetermined -> scale through the point (matches LinearCalibrator)
+            return cls([float(gt[0] / pred[0]), 0.0])
         deg = int(min(degree, max(1, pred.size - 1)))
         coeffs = np.polyfit(pred, gt, deg)
         return cls(coeffs)
