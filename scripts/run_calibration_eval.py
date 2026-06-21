@@ -250,6 +250,12 @@ def save_overlay(
         cv2.drawMarker(annotated, center_xy, (0, 0, 255), markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
 
     if depth is not None and np.isfinite(depth).any():
+        # depth may be at the model's native grid (e.g. Pi3X 672x378) while the frame is
+        # 720x404; resize to the frame so the side-by-side panels share a row count
+        # (cv2.hconcat requires it). NEAREST avoids interpolating across NaN/invalid pixels.
+        if depth.shape[:2] != frame_bgr.shape[:2]:
+            depth = cv2.resize(depth, (frame_bgr.shape[1], frame_bgr.shape[0]),
+                               interpolation=cv2.INTER_NEAREST)
         finite = depth[np.isfinite(depth)]
         d_min, d_max = float(finite.min()), float(finite.max())
         norm = np.clip((depth - d_min) / max(d_max - d_min, 1e-6), 0.0, 1.0)
@@ -508,14 +514,22 @@ def main() -> None:
             frames_buffer = list(iter_frames_at_indices(video_path, frame_indices))
 
             # single joint depth inference over all frames — both Pi3X and DA3NESTED are
-            # multi-view architectures that give better metric scale with N > 1
-            all_frames_bgr = [bgr for _, bgr in frames_buffer]
-            try:
-                all_depths = depth_fn(all_frames_bgr)
-            except Exception as exc:  # noqa: BLE001 - depth failure shouldn't abort the video
-                print(f"  !! depth inference failed for {video_path}: {exc}")
-                all_depths = [None] * len(frames_buffer)
-            depth_by_idx = {fid: d for (fid, _), d in zip(frames_buffer, all_depths)}
+            # multi-view architectures that give better metric scale with N > 1.
+            # Only feed frames that actually decoded: a frame index past the video's end
+            # yields None, and one None frame would make the whole batch throw (cvtColor on
+            # an empty array), sinking depth for every frame of the video. Run inference on
+            # the decoded frames only and map results back; None-decoded indices keep depth
+            # None and are reported per-frame as frame_decode_error.
+            depth_by_idx: dict[int, np.ndarray | None] = {fid: None for fid, _ in frames_buffer}
+            decoded = [(fid, bgr) for fid, bgr in frames_buffer if bgr is not None]
+            if decoded:
+                try:
+                    decoded_depths = depth_fn([bgr for _, bgr in decoded])
+                except Exception as exc:  # noqa: BLE001 - depth failure shouldn't abort the video
+                    print(f"  !! depth inference failed for {video_path}: {exc}")
+                    decoded_depths = [None] * len(decoded)
+                for (fid, _), d in zip(decoded, decoded_depths):
+                    depth_by_idx[fid] = d
 
             if args.save_depth_dir is not None:
                 save_depth_maps(args.save_depth_dir, rows[row_indices[0]]["video_name"], depth_by_idx)
