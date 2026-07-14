@@ -112,3 +112,58 @@ depth map with a metres-labelled scale bar, annotated with `status`,
 the one the script itself decoded (`iter_frames_at_indices`'s loop counter),
 not a value re-read from the CSV — comparing it against the visible frame
 content is a direct check that the correct frame was extracted.
+
+## Per-video depth calibration
+
+The metric depth backends are residually mis-scaled per camera. Because each
+annotated frame gives one sparse `(predicted-depth-at-subject, true-distance)`
+point, we can fit a small **per-video** transform from that video's annotated
+frames and apply it to its depth maps — the inference-time, per-deployment idea
+from [`timmh/distance-estimation`](https://github.com/timmh/distance-estimation).
+This is a two-stage workflow so the cheap calibration can be re-run (different
+models) without re-running depth inference.
+
+**Stage 1 — persist the original depth maps** (adds one flag to the eval run):
+
+```bash
+python scripts/run_calibration_eval.py --device cuda --limit 40 \
+  --output-csv outputs/smoke_results.csv \
+  --save-depth-dir outputs/depth_orig
+```
+
+`--save-depth-dir` writes one fp16 `.npy` per frame
+(`<video_name>_frame<NNNNNN>_orig.npy`, keyed by the flat annotation name so it
+never collides across camera folders). The results CSV also now carries the
+subject centroid (`center_x`, `center_y`, `center_y_norm`).
+
+**Stage 2 — fit per-video calibration and write calibrated maps** (CPU only,
+no torch):
+
+```bash
+python scripts/calibrate_depth.py \
+  --results-csv outputs/smoke_results.csv \
+  --depth-dir outputs/depth_orig --out-dir outputs/depth_calib \
+  --method linear --viz
+```
+
+For every video it fits the chosen transform on that video's sparse points,
+applies it to each saved map (`<...>_calib.npy`), and — with `--viz` — writes an
+`orig | calib` colourised PNG. It also writes `outputs/calibration_fits.csv`
+(per-video method, fitted params, and **leave-one-out** calibrated-vs-uncalibrated
+MAE) and prints an aggregate improvement summary.
+
+`--method` selects the calibration model (`scripts/calibration.py`):
+
+| `--method` | model | notes |
+|---|---|---|
+| `scale` | `d_cal = s·d` | 1 param, robust; low-N fallback |
+| `linear` | `d_cal = a·d + b` | the simple default |
+| `disparity` | affine in `1/d` | depth error is often affine in disparity |
+| `poly` | degree-k polynomial (`--degree`) | capped to what the point count supports |
+| `poly2d` | `f(depth, vertical-position)` | also uses the subject's image row (ground-plane geometry) |
+
+Omit `--depth-dir` to only fit and report leave-one-out MAE from the CSV (handy
+for quickly comparing methods before writing any maps). Re-run with a different
+`--method` on the same `--depth-dir` to compare without re-running inference.
+
+Unit tests for the calibration maths: `python scripts/test_calibration.py`.

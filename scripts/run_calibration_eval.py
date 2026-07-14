@@ -33,6 +33,7 @@ from torchvision import transforms
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.frame_source import iter_frames_at_indices
 from scripts.video_lookup import load_anno_to_path, resolve_video_path
+from scripts.depth_viz import DEPTH_COLORMAP, make_depth_colorbar
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SAM3_CHECKPOINT = Path(
@@ -62,6 +63,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="dump a frame|mask|depth sanity-check PNG per processed frame here "
              "(labelled with the script-decoded frame index; requires --limit)",
+    )
+    p.add_argument(
+        "--save-depth-dir",
+        type=Path,
+        default=None,
+        help="persist each frame's native-resolution depth map as fp16 .npy here "
+             "(keyed by video_name + frame_idx), so calibrate_depth.py can fit/apply a "
+             "per-video calibration without re-running depth inference. Safe on full runs.",
     )
     args = p.parse_args()
     if args.overlay_dir is not None and args.limit is None:
@@ -215,23 +224,9 @@ def compute_depth_centroid(depth: np.ndarray, center_xy: tuple[int, int] | None)
 # --------------------------------------------------------------------------------------
 # overlay dumps: frame | mask outline + centroid | depth colormap, for visually
 # sanity-checking frame extraction, segmentation, and depth on a small (--limit'ed) run.
+# DEPTH_COLORMAP / make_depth_colorbar live in scripts/depth_viz.py (shared with
+# calibrate_depth.py).
 # --------------------------------------------------------------------------------------
-
-DEPTH_COLORMAP = cv2.COLORMAP_TURBO
-
-
-def make_depth_colorbar(height: int, d_min: float, d_max: float, bar_width: int = 30, label_width: int = 80) -> np.ndarray:
-    """Vertical scale bar (max at top, min at bottom) in DEPTH_COLORMAP, labelled
-    with the metric depth range (metres) it represents."""
-    gradient = np.linspace(255, 0, height, dtype=np.uint8).reshape(-1, 1)
-    bar = cv2.applyColorMap(np.repeat(gradient, bar_width, axis=1), DEPTH_COLORMAP)
-
-    canvas = np.zeros((height, bar_width + label_width, 3), dtype=np.uint8)
-    canvas[:, :bar_width] = bar
-    for value, y in ((d_max, 15), (d_min, height - 8)):
-        cv2.putText(canvas, f"{value:.2f}m", (bar_width + 4, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
-    return canvas
 
 
 def save_overlay(
@@ -255,6 +250,12 @@ def save_overlay(
         cv2.drawMarker(annotated, center_xy, (0, 0, 255), markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
 
     if depth is not None and np.isfinite(depth).any():
+        # depth may be at the model's native grid (e.g. Pi3X 672x378) while the frame is
+        # 720x404; resize to the frame so the side-by-side panels share a row count
+        # (cv2.hconcat requires it). NEAREST avoids interpolating across NaN/invalid pixels.
+        if depth.shape[:2] != frame_bgr.shape[:2]:
+            depth = cv2.resize(depth, (frame_bgr.shape[1], frame_bgr.shape[0]),
+                               interpolation=cv2.INTER_NEAREST)
         finite = depth[np.isfinite(depth)]
         d_min, d_max = float(finite.min()), float(finite.max())
         norm = np.clip((depth - d_min) / max(d_max - d_min, 1e-6), 0.0, 1.0)
@@ -309,6 +310,31 @@ def _maybe_save_overlay(
 # shares the frame.
 # --------------------------------------------------------------------------------------
 
+def save_depth_maps(out_dir: Path, video_name: str, depth_by_idx: dict) -> None:
+    """Persist each frame's native-resolution depth map as fp16 .npy, keyed by the flat
+    annotation name (`video_name`) so files don't collide across camera folders that reuse
+    filenames like DSCF0005 (unlike save_overlay, which keys on video_path.stem). These are
+    reloaded by calibrate_depth.py to fit/apply a per-video calibration without re-inferring."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for frame_idx, depth in depth_by_idx.items():
+        if depth is None:
+            continue
+        np.save(out_dir / f"{video_name}_frame{frame_idx:06d}_orig.npy", depth.astype(np.float16))
+
+
+def _center_fields(center_xy: tuple[int, int] | None,
+                   frame_shape_hw: tuple[int, int] | None = None) -> dict:
+    """Expose the subject (mask-bbox) centroid as flat CSV columns. calibrate_depth.py's
+    poly2d calibrator uses `center_y_norm` (vertical position normalized to [0, 1]) to fit
+    ground-plane geometry; normalizing here keeps it resolution-independent so it lines up
+    with the depth map's own rows at apply time, regardless of either resolution."""
+    if center_xy is None:
+        return {"center_x": None, "center_y": None, "center_y_norm": None}
+    cx, cy = center_xy
+    cy_norm = (cy + 0.5) / frame_shape_hw[0] if frame_shape_hw and frame_shape_hw[0] else None
+    return {"center_x": cx, "center_y": cy, "center_y_norm": cy_norm}
+
+
 def process_frame(
     sam3,
     frame_bgr: np.ndarray | None,
@@ -320,7 +346,7 @@ def process_frame(
 ) -> dict:
     if frame_bgr is None:
         result = {"status": "frame_decode_error", "mask_area_px": None,
-                  "depth_mask_mean": None, "depth_centroid": None}
+                  "depth_mask_mean": None, "depth_centroid": None, **_center_fields(None)}
         _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result)
         return result
 
@@ -333,19 +359,22 @@ def process_frame(
         union_mask, center_xy, mask_area_px = extract_union_mask(sam_results[0], frame_shape_hw)
     except Exception as exc:  # noqa: BLE001 - record and continue
         result = {"status": f"sam_error: {exc}", "mask_area_px": None,
-                  "depth_mask_mean": None, "depth_centroid": None}
+                  "depth_mask_mean": None, "depth_centroid": None,
+                  **_center_fields(center_xy, frame_shape_hw)}
         _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth)
         return result
 
     if mask_area_px == 0:
         result = {"status": "empty_mask", "mask_area_px": 0,
-                  "depth_mask_mean": None, "depth_centroid": None}
+                  "depth_mask_mean": None, "depth_centroid": None,
+                  **_center_fields(center_xy, frame_shape_hw)}
         _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth)
         return result
 
     if depth is None:
         result = {"status": "depth_error: no depth map (inference failed for this video)",
-                  "mask_area_px": mask_area_px, "depth_mask_mean": None, "depth_centroid": None}
+                  "mask_area_px": mask_area_px, "depth_mask_mean": None, "depth_centroid": None,
+                  **_center_fields(center_xy, frame_shape_hw)}
         _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth)
         return result
 
@@ -355,12 +384,14 @@ def process_frame(
         depth_centroid = compute_depth_centroid(depth_resized, center_xy)
     except Exception as exc:  # noqa: BLE001
         result = {"status": f"depth_error: {exc}", "mask_area_px": mask_area_px,
-                  "depth_mask_mean": None, "depth_centroid": None}
+                  "depth_mask_mean": None, "depth_centroid": None,
+                  **_center_fields(center_xy, frame_shape_hw)}
         _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth)
         return result
 
     result = {"status": "processed", "mask_area_px": mask_area_px,
-              "depth_mask_mean": depth_mask_mean, "depth_centroid": depth_centroid}
+              "depth_mask_mean": depth_mask_mean, "depth_centroid": depth_centroid,
+              **_center_fields(center_xy, frame_shape_hw)}
     _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth_resized)
     return result
 
@@ -379,6 +410,9 @@ OUTPUT_FIELDS = [
     "mask_area_px",
     "depth_mask_mean",
     "depth_centroid",
+    "center_x",
+    "center_y",
+    "center_y_norm",
 ]
 
 
@@ -480,14 +514,25 @@ def main() -> None:
             frames_buffer = list(iter_frames_at_indices(video_path, frame_indices))
 
             # single joint depth inference over all frames — both Pi3X and DA3NESTED are
-            # multi-view architectures that give better metric scale with N > 1
-            all_frames_bgr = [bgr for _, bgr in frames_buffer]
-            try:
-                all_depths = depth_fn(all_frames_bgr)
-            except Exception as exc:  # noqa: BLE001 - depth failure shouldn't abort the video
-                print(f"  !! depth inference failed for {video_path}: {exc}")
-                all_depths = [None] * len(frames_buffer)
-            depth_by_idx = {fid: d for (fid, _), d in zip(frames_buffer, all_depths)}
+            # multi-view architectures that give better metric scale with N > 1.
+            # Only feed frames that actually decoded: a frame index past the video's end
+            # yields None, and one None frame would make the whole batch throw (cvtColor on
+            # an empty array), sinking depth for every frame of the video. Run inference on
+            # the decoded frames only and map results back; None-decoded indices keep depth
+            # None and are reported per-frame as frame_decode_error.
+            depth_by_idx: dict[int, np.ndarray | None] = {fid: None for fid, _ in frames_buffer}
+            decoded = [(fid, bgr) for fid, bgr in frames_buffer if bgr is not None]
+            if decoded:
+                try:
+                    decoded_depths = depth_fn([bgr for _, bgr in decoded])
+                except Exception as exc:  # noqa: BLE001 - depth failure shouldn't abort the video
+                    print(f"  !! depth inference failed for {video_path}: {exc}")
+                    decoded_depths = [None] * len(decoded)
+                for (fid, _), d in zip(decoded, decoded_depths):
+                    depth_by_idx[fid] = d
+
+            if args.save_depth_dir is not None:
+                save_depth_maps(args.save_depth_dir, rows[row_indices[0]]["video_name"], depth_by_idx)
 
             for frame_idx, frame_bgr in frames_buffer:
                 overlay_path = overlay_meta = None
