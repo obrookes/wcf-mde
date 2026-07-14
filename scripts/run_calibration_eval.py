@@ -8,8 +8,13 @@ For every annotated row (video_name, frame_idx, frame_timestamp, distance):
   3. estimate metric depth jointly across all annotated frames in one inference call
      (both Pi3X and DA3NESTED are multi-view architectures; joint inference gives better
      metric scale than processing each frame independently)
-  4. segment each frame with SAM-3 (text prompt, default "person holding sign") -> union mask
-  5. reduce mask + precomputed depth to a single distance estimate (mean-in-mask, centroid)
+  4. segment each frame with SAM-3 (text prompt, default "person holding sign") -> one mask per
+     detected instance (some frames have >1 person holding a placard; this can't be known from
+     the annotations CSV ahead of time, only discovered from what SAM-3 actually returns, so
+     every frame is treated as potentially-multi-instance)
+  5. reduce each instance's mask + precomputed depth to a distance estimate (mean-in-mask,
+     centroid); a frame with N detected instances fans its one ground-truth distance out to N
+     output rows (one per instance) rather than collapsing them into a single blended value
   6. write predicted vs ground-truth distance to an output CSV, plus a summary
 
 Patterns for SAM-3 invocation, mask extraction, and mask->depth reduction are adapted
@@ -34,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.frame_source import iter_frames_at_indices
 from scripts.video_lookup import load_anno_to_path, resolve_video_path
 from scripts.depth_viz import DEPTH_COLORMAP, make_depth_colorbar
+from scripts.masks import save_instance_masks
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SAM3_CHECKPOINT = Path(
@@ -71,6 +77,15 @@ def parse_args() -> argparse.Namespace:
         help="persist each frame's native-resolution depth map as fp16 .npy here "
              "(keyed by video_name + frame_idx), so calibrate_depth.py can fit/apply a "
              "per-video calibration without re-running depth inference. Safe on full runs.",
+    )
+    p.add_argument(
+        "--save-mask-dir",
+        type=Path,
+        default=None,
+        help="persist each frame's detected-instance SAM-3 masks as COCO RLE JSON here "
+             "(keyed by video_name + frame_idx; one entry per instance, ordered to match "
+             "instance_idx in --output-csv), for Stage-1 alignment (scripts/alignment.py) "
+             "to reload without re-running SAM-3. Safe on full runs.",
     )
     args = p.parse_args()
     if args.overlay_dir is not None and args.limit is None:
@@ -158,37 +173,55 @@ def run_da3_depth_batch(model, frames_bgr: list[np.ndarray], device: torch.devic
 
 
 # --------------------------------------------------------------------------------------
-# SAM-3 mask extraction (single text prompt -> union boolean mask + bbox centroid)
+# SAM-3 mask extraction: one boolean mask + bbox centroid per detected instance.
+#
+# Multi-person frames (>1 placard-holder) can't be flagged ahead of time from the
+# annotations CSV -- there's no metadata column for it, only whatever SAM-3 actually detects
+# in a given frame. So every frame goes through this same per-instance path regardless of
+# whether it's "known" to have one subject or several; the union-mask short-cut this used to
+# take silently blended multiple subjects' depths into one meaningless average.
 # --------------------------------------------------------------------------------------
 
-def extract_union_mask(sam_result, frame_shape_hw: tuple[int, int]) -> tuple[np.ndarray, tuple[int, int] | None, int]:
+def extract_instance_masks(sam_result, frame_shape_hw: tuple[int, int]) -> list[dict]:
+    """Return one {"mask", "center_xy", "area_px"} dict per SAM-3 detection, sorted
+    left-to-right by center_x for a stable, human-checkable instance order. Empty list if
+    SAM-3 found nothing."""
     height, width = frame_shape_hw
-    union = np.zeros((height, width), dtype=bool)
 
     masks = getattr(sam_result, "masks", None)
     if masks is None or masks.data is None:
-        return union, None, 0
+        return []
 
     masks_data = masks.data.detach().cpu().numpy()
     if masks_data.size == 0:
-        return union, None, 0
+        return []
 
+    instances: list[dict] = []
     for det_mask in masks_data > 0:
         if det_mask.shape != (height, width):
             det_mask = cv2.resize(
                 det_mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST
             ).astype(bool)
-        union |= det_mask
+        area_px = int(det_mask.sum())
+        if area_px == 0:
+            continue
+        ys, xs = np.where(det_mask)
+        xmin, xmax = int(xs.min()), int(xs.max())
+        ymin, ymax = int(ys.min()), int(ys.max())
+        center_xy = (int((xmin + xmax) // 2), int((ymin + ymax) // 2))
+        instances.append({"mask": det_mask, "center_xy": center_xy, "area_px": area_px})
 
-    mask_pixels = int(union.sum())
-    if mask_pixels == 0:
-        return union, None, 0
+    instances.sort(key=lambda inst: inst["center_xy"][0])
+    return instances
 
-    ys, xs = np.where(union)
-    xmin, xmax = int(xs.min()), int(xs.max())
-    ymin, ymax = int(ys.min()), int(ys.max())
-    center_xy = (int((xmin + xmax) // 2), int((ymin + ymax) // 2))
-    return union, center_xy, mask_pixels
+
+def union_mask_from_instances(instances: list[dict], frame_shape_hw: tuple[int, int]) -> np.ndarray:
+    """Only for overlay visualization -- draws all instances' outlines as one contour set."""
+    height, width = frame_shape_hw
+    union = np.zeros((height, width), dtype=bool)
+    for inst in instances:
+        union |= inst["mask"]
+    return union
 
 
 # --------------------------------------------------------------------------------------
@@ -233,21 +266,26 @@ def save_overlay(
     out_path: Path,
     frame_bgr: np.ndarray,
     meta: dict,
-    union_mask: np.ndarray | None,
-    center_xy: tuple[int, int] | None,
+    instances: list[dict] | None,
     depth: np.ndarray | None,
-    fields: dict,
+    fields_by_instance: list[dict],
 ) -> None:
     """Write a frame|mask|depth panel labelled with the *script-decoded* frame index
     (`meta["frame_idx"]`, the iter_frames_at_indices loop counter) rather than a value
     re-read from the CSV row, so the image itself can confirm the correct frame was
-    extracted, independent of any row/CSV bookkeeping."""
+    extracted, independent of any row/CSV bookkeeping. Draws every detected instance's
+    outline + centroid (labelled with its instance index) so multi-person frames are visibly
+    distinguishable from single-person ones, not just implied by the printed fields."""
     annotated = frame_bgr.copy()
-    if union_mask is not None:
+    if instances:
+        union_mask = union_mask_from_instances(instances, frame_bgr.shape[:2])
         contours, _ = cv2.findContours(union_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(annotated, contours, -1, (0, 255, 0), 2)
-    if center_xy is not None:
-        cv2.drawMarker(annotated, center_xy, (0, 0, 255), markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
+        for idx, inst in enumerate(instances):
+            cv2.drawMarker(annotated, inst["center_xy"], (0, 0, 255),
+                           markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
+            cv2.putText(annotated, str(idx), (inst["center_xy"][0] + 8, inst["center_xy"][1] - 8),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
 
     if depth is not None and np.isfinite(depth).any():
         # depth may be at the model's native grid (e.g. Pi3X 672x378) while the frame is
@@ -269,12 +307,13 @@ def save_overlay(
     lines = [
         f"video={meta['video_name']}",
         f"frame_idx (script-decoded)={meta['frame_idx']}",
-        f"status={fields['status']}",
-        f"mask_area_px={fields['mask_area_px']}",
-        f"depth_mask_mean={fields['depth_mask_mean']}",
-        f"depth_centroid={fields['depth_centroid']}",
-        f"distance_gt={meta['distance_gt']}",
+        f"distance_gt={meta['distance_gt']}  ({len(fields_by_instance)} instance(s))",
     ]
+    for idx, fields in enumerate(fields_by_instance):
+        lines.append(
+            f"  [{idx}] status={fields['status']} mask_area_px={fields['mask_area_px']} "
+            f"depth_mask_mean={fields['depth_mask_mean']} depth_centroid={fields['depth_centroid']}"
+        )
     for n, line in enumerate(lines):
         org = (10, 25 + 22 * n)
         cv2.putText(panel, line, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
@@ -288,26 +327,29 @@ def _maybe_save_overlay(
     overlay_path: Path | None,
     meta: dict | None,
     frame_bgr: np.ndarray | None,
-    fields: dict,
-    union_mask: np.ndarray | None = None,
-    center_xy: tuple[int, int] | None = None,
-    depth: np.ndarray | None = None,
+    instances: list[dict] | None,
+    depth: np.ndarray | None,
+    fields_by_instance: list[dict],
 ) -> None:
     if overlay_path is None or frame_bgr is None:
         return
     try:
-        save_overlay(overlay_path, frame_bgr, meta, union_mask, center_xy, depth, fields)
+        save_overlay(overlay_path, frame_bgr, meta, instances, depth, fields_by_instance)
     except Exception as exc:  # noqa: BLE001 - overlay dumping must never break the run
         print(f"  !! failed to write overlay {overlay_path}: {exc}")
 
 
 # --------------------------------------------------------------------------------------
-# per-frame pipeline: decoded frame -> {status, mask_area_px, depth_mask_mean, depth_centroid}
+# per-frame pipeline: decoded frame -> list of {instance_idx, status, mask_area_px,
+# depth_mask_mean, depth_centroid} dicts, one per detected instance (>=1 for a processed
+# frame with detections, exactly 1 with instance_idx=None for a frame-level failure/no-detection
+# so every annotation row still gets at least one output row).
 #
 # Run once per decoded frame (not once per annotation row): multiple CSV rows can reference
 # the same (video_name, frame_idx), and SAM-3 / Pi3X inference is by far the most expensive
 # part of the pipeline, so the result is computed here and then fanned out to every row that
-# shares the frame.
+# shares the frame -- and, when a frame has N detected instances, each of those rows is further
+# fanned out to N output rows, one per instance, all sharing that row's ground-truth distance.
 # --------------------------------------------------------------------------------------
 
 def save_depth_maps(out_dir: Path, video_name: str, depth_by_idx: dict) -> None:
@@ -343,57 +385,65 @@ def process_frame(
     device: torch.device,
     overlay_path: Path | None = None,
     overlay_meta: dict | None = None,
-) -> dict:
+    mask_dir: Path | None = None,
+    mask_video_name: str | None = None,
+    mask_frame_idx: int | None = None,
+) -> list[dict]:
     if frame_bgr is None:
-        result = {"status": "frame_decode_error", "mask_area_px": None,
-                  "depth_mask_mean": None, "depth_centroid": None, **_center_fields(None)}
-        _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result)
-        return result
+        results = [{"instance_idx": None, "status": "frame_decode_error", "mask_area_px": None,
+                    "depth_mask_mean": None, "depth_centroid": None, **_center_fields(None)}]
+        _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, None, None, results)
+        return results
 
     frame_shape_hw = frame_bgr.shape[:2]
-    union_mask: np.ndarray | None = None
-    center_xy: tuple[int, int] | None = None
 
     try:
         sam_results = sam3(source=frame_bgr, text=[prompt])
-        union_mask, center_xy, mask_area_px = extract_union_mask(sam_results[0], frame_shape_hw)
+        instances = extract_instance_masks(sam_results[0], frame_shape_hw)
     except Exception as exc:  # noqa: BLE001 - record and continue
-        result = {"status": f"sam_error: {exc}", "mask_area_px": None,
-                  "depth_mask_mean": None, "depth_centroid": None,
-                  **_center_fields(center_xy, frame_shape_hw)}
-        _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth)
-        return result
+        results = [{"instance_idx": None, "status": f"sam_error: {exc}", "mask_area_px": None,
+                    "depth_mask_mean": None, "depth_centroid": None,
+                    **_center_fields(None, frame_shape_hw)}]
+        _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, None, depth, results)
+        return results
 
-    if mask_area_px == 0:
-        result = {"status": "empty_mask", "mask_area_px": 0,
-                  "depth_mask_mean": None, "depth_centroid": None,
-                  **_center_fields(center_xy, frame_shape_hw)}
-        _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth)
-        return result
+    if mask_dir is not None and instances:
+        save_instance_masks(mask_dir, mask_video_name, mask_frame_idx, instances)
+
+    if not instances:
+        results = [{"instance_idx": None, "status": "empty_mask", "mask_area_px": 0,
+                    "depth_mask_mean": None, "depth_centroid": None,
+                    **_center_fields(None, frame_shape_hw)}]
+        _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, instances, depth, results)
+        return results
 
     if depth is None:
-        result = {"status": "depth_error: no depth map (inference failed for this video)",
-                  "mask_area_px": mask_area_px, "depth_mask_mean": None, "depth_centroid": None,
-                  **_center_fields(center_xy, frame_shape_hw)}
-        _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth)
-        return result
+        results = [
+            {"instance_idx": idx, "status": "depth_error: no depth map (inference failed for this video)",
+             "mask_area_px": inst["area_px"], "depth_mask_mean": None, "depth_centroid": None,
+             **_center_fields(inst["center_xy"], frame_shape_hw)}
+            for idx, inst in enumerate(instances)
+        ]
+        _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, instances, depth, results)
+        return results
 
-    try:
-        depth_resized = _resize_depth_to(depth, frame_shape_hw)
-        depth_mask_mean = compute_depth_mask_mean(depth_resized, union_mask)
-        depth_centroid = compute_depth_centroid(depth_resized, center_xy)
-    except Exception as exc:  # noqa: BLE001
-        result = {"status": f"depth_error: {exc}", "mask_area_px": mask_area_px,
-                  "depth_mask_mean": None, "depth_centroid": None,
-                  **_center_fields(center_xy, frame_shape_hw)}
-        _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth)
-        return result
-
-    result = {"status": "processed", "mask_area_px": mask_area_px,
-              "depth_mask_mean": depth_mask_mean, "depth_centroid": depth_centroid,
-              **_center_fields(center_xy, frame_shape_hw)}
-    _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, result, union_mask, center_xy, depth_resized)
-    return result
+    depth_resized = _resize_depth_to(depth, frame_shape_hw)
+    results = []
+    for idx, inst in enumerate(instances):
+        try:
+            depth_mask_mean = compute_depth_mask_mean(depth_resized, inst["mask"])
+            depth_centroid = compute_depth_centroid(depth_resized, inst["center_xy"])
+            status = "processed"
+        except Exception as exc:  # noqa: BLE001 - one bad instance shouldn't sink the others
+            depth_mask_mean = depth_centroid = None
+            status = f"depth_error: {exc}"
+        results.append({
+            "instance_idx": idx, "status": status, "mask_area_px": inst["area_px"],
+            "depth_mask_mean": depth_mask_mean, "depth_centroid": depth_centroid,
+            **_center_fields(inst["center_xy"], frame_shape_hw),
+        })
+    _maybe_save_overlay(overlay_path, overlay_meta, frame_bgr, instances, depth_resized, results)
+    return results
 
 
 # --------------------------------------------------------------------------------------
@@ -406,6 +456,7 @@ OUTPUT_FIELDS = [
     "frame_timestamp",
     "distance_gt",
     "depth_model",
+    "instance_idx",
     "status",
     "mask_area_px",
     "depth_mask_mean",
@@ -439,28 +490,36 @@ def main() -> None:
 
     anno_to_path = load_anno_to_path(args.video_list_xlsx, args.data_dir)
 
-    # group row indices by resolved video path, marking unresolvable ones up front
+    # group row indices by resolved video path, marking unresolvable ones up front.
+    # `results` is appended to, not indexed by input row: a single annotation row can now
+    # fan out to N output rows (one per SAM-3 instance detected in that frame), so `filled`
+    # tracks which input rows already got at least one output row (used by the video-level
+    # error handler below to avoid double-emitting for rows processed before a mid-video
+    # exception).
     groups: dict[Path, list[int]] = defaultdict(list)
-    results: list[dict | None] = [None] * len(rows)
+    results: list[dict] = []
+    filled: set[int] = set()
     for i, row in enumerate(rows):
         try:
             video_path = resolve_video_path(row["video_name"], anno_to_path)
         except (KeyError, FileNotFoundError):
-            results[i] = {
+            results.append({
                 "video_name": row["video_name"],
                 "frame_idx": row["frame_idx"],
                 "frame_timestamp": row["frame_timestamp"],
                 "distance_gt": row["distance_gt"],
                 "depth_model": args.depth_model,
+                "instance_idx": None,
                 "status": "video_missing",
                 "mask_area_px": None,
                 "depth_mask_mean": None,
                 "depth_centroid": None,
-            }
+            })
+            filled.add(i)
             continue
         groups[video_path].append(i)
 
-    n_missing = sum(1 for r in results if r is not None)
+    n_missing = len(filled)
     print(f"resolved {len(groups)} distinct videos; {n_missing} rows reference videos not present on disk")
 
     print(f"loading SAM-3 ({args.sam3_checkpoint}) with prompt {args.sam3_prompt!r} ...")
@@ -545,24 +604,29 @@ def main() -> None:
                     }
                     overlay_path = args.overlay_dir / f"{video_path.stem}_frame{frame_idx:06d}.png"
 
-                frame_fields = process_frame(
+                video_name = rows[idx_to_row_indices[frame_idx][0]]["video_name"]
+                frame_fields_list = process_frame(
                     sam3, frame_bgr, depth_by_idx.get(frame_idx),
                     args.sam3_prompt, device,
                     overlay_path=overlay_path, overlay_meta=overlay_meta,
+                    mask_dir=args.save_mask_dir, mask_video_name=video_name, mask_frame_idx=frame_idx,
                 )
                 for i in idx_to_row_indices[frame_idx]:
-                    results[i] = row_dict(i, frame_fields)
+                    for fields in frame_fields_list:
+                        results.append(row_dict(i, fields))
+                    filled.add(i)
 
                 n_done += 1
                 if n_done % 25 == 0:
                     print(f"  ... {n_done} frames processed")
         except Exception as exc:  # noqa: BLE001 - record, preserve prior results, move to next video
             print(f"  !! video-level error on {video_path}: {exc}")
-            error_fields = {"status": f"video_error: {exc}", "mask_area_px": None,
+            error_fields = {"instance_idx": None, "status": f"video_error: {exc}", "mask_area_px": None,
                             "depth_mask_mean": None, "depth_centroid": None}
             for i in row_indices:
-                if results[i] is None:
-                    results[i] = row_dict(i, error_fields)
+                if i not in filled:
+                    results.append(row_dict(i, error_fields))
+                    filled.add(i)
 
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output_csv, "w", newline="") as f:

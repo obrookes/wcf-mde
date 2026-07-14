@@ -24,10 +24,10 @@ from __future__ import annotations
 
 import numpy as np
 
-METHODS = ("scale", "linear", "disparity", "poly", "poly2d")
+METHODS = ("scale", "linear", "disparity", "poly", "poly2d", "piecewise")
 
 # minimum number of points a method needs to be fully determined (used to gate LOO CV)
-_MIN_POINTS = {"scale": 1, "linear": 2, "disparity": 2, "poly": 2, "poly2d": 4}
+_MIN_POINTS = {"scale": 1, "linear": 2, "disparity": 2, "poly": 2, "poly2d": 4, "piecewise": 4}
 
 
 # --------------------------------------------------------------------------------------
@@ -218,12 +218,80 @@ class Poly2DCalibrator(Calibrator):
         return (x @ self.coeffs).reshape(shape)
 
 
+class PiecewiseCalibrator(Calibrator):
+    """Two linear segments meeting continuously at a fitted breakpoint k (predicted-depth
+    space): d_cal = a1*d+b1 for d<=k, else a1*k+b1 + a2*(d-k). Matches Markham-25's segmented
+    (piecewise/breakpoint) regression, used when a single global linear/poly fit under-serves
+    both near and far ranges. Continuity at k is enforced by construction, not fit."""
+
+    method = "piecewise"
+
+    def __init__(self, a1: float, b1: float, a2: float, k: float) -> None:
+        super().__init__()
+        self.a1 = float(a1)
+        self.b1 = float(b1)
+        self.a2 = float(a2)
+        self.k = float(k)
+        self.params = {"a1": self.a1, "b1": self.b1, "a2": self.a2, "k": self.k}
+
+    @classmethod
+    def fit(cls, pred: np.ndarray, gt: np.ndarray) -> "PiecewiseCalibrator":
+        n = pred.size
+        uniq = np.unique(pred)
+        if n < 4 or uniq.size < 2:
+            # too few points/distinct values to fit two segments -> single-segment fallback,
+            # behaves exactly like LinearCalibrator (k=+inf so predict never takes the k<d branch)
+            lin = LinearCalibrator.fit(pred, gt)
+            return cls(lin.a, lin.b, lin.a, float("inf"))
+
+        candidates = uniq[1:-1]  # interior order statistics -> both sides keep >=2 points
+        if candidates.size == 0:
+            lin = LinearCalibrator.fit(pred, gt)
+            return cls(lin.a, lin.b, lin.a, float("inf"))
+
+        best = None
+        for k in candidates:
+            lo = pred <= k
+            hi = ~lo
+            if lo.sum() < 2 or hi.sum() < 1:
+                continue
+            a1, b1 = np.polyfit(pred[lo], gt[lo], 1)
+            # continuity: intercept on the high side is pinned to a1*k+b1 at d=k, so only the
+            # slope a2 is free -> least-squares over (d-k) vs (gt - (a1*k+b1))
+            x_hi = pred[hi] - k
+            y_hi = gt[hi] - (a1 * k + b1)
+            if hi.sum() >= 1 and np.any(x_hi != 0):
+                a2 = float(np.sum(x_hi * y_hi) / np.sum(x_hi * x_hi))
+            else:
+                a2 = a1
+            pred_lo = a1 * pred[lo] + b1
+            pred_hi = (a1 * k + b1) + a2 * x_hi
+            sse = float(np.sum((pred_lo - gt[lo]) ** 2) + np.sum((pred_hi - gt[hi]) ** 2))
+            if best is None or sse < best[0]:
+                best = (sse, a1, b1, a2, float(k))
+
+        if best is None:
+            lin = LinearCalibrator.fit(pred, gt)
+            return cls(lin.a, lin.b, lin.a, float("inf"))
+        _, a1, b1, a2, k = best
+        return cls(a1, b1, a2, k)
+
+    def predict(self, d, y=None) -> np.ndarray:
+        d = np.asarray(d, dtype=np.float64)
+        lo_val = self.a1 * d + self.b1
+        if np.isinf(self.k):  # single-segment fallback -- avoid inf-inf nan in the unused branch
+            return lo_val
+        hi_val = (self.a1 * self.k + self.b1) + self.a2 * (d - self.k)
+        return np.where(d <= self.k, lo_val, hi_val)
+
+
 _REGISTRY = {
     "scale": ScaleCalibrator,
     "linear": LinearCalibrator,
     "disparity": DisparityCalibrator,
     "poly": PolyCalibrator,
     "poly2d": Poly2DCalibrator,
+    "piecewise": PiecewiseCalibrator,
 }
 
 
@@ -285,6 +353,8 @@ def fit_calibration(
         return DisparityCalibrator.fit(pred, gt)
     if method == "poly":
         return PolyCalibrator.fit(pred, gt, degree=degree)
+    if method == "piecewise":
+        return PiecewiseCalibrator.fit(pred, gt)
     # poly2d
     if ys_arr is None:
         raise ValueError("poly2d requires per-point vertical positions `ys`")

@@ -74,6 +74,43 @@ def test_apply_marks_nonphysical_extrapolation_invalid():
     assert np.isnan(out[0, 1])  # non-physical extrapolation marked invalid, not written
 
 
+def test_piecewise_recovers_known_breakpoint():
+    a1, b1, a2, k = 2.0, 1.0, 5.0, 10.0
+    d_lo = np.array([2.0, 4.0, 6.0, 8.0, 10.0])  # includes the breakpoint itself
+    d_hi = np.array([12.0, 15.0, 18.0, 20.0])
+    d = np.concatenate([d_lo, d_hi])
+    gt_lo = a1 * d_lo + b1
+    gt_hi = (a1 * k + b1) + a2 * (d_hi - k)
+    gt = np.concatenate([gt_lo, gt_hi])
+    cal = fit_calibration(d, gt, "piecewise")
+    np.testing.assert_allclose(cal.predict(d), gt, rtol=1e-6, atol=1e-6)
+
+
+def test_piecewise_is_continuous_at_breakpoint():
+    d = np.array([1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 14.0, 17.0])
+    gt = np.where(d <= 8.0, 2.0 * d, 2.0 * 8.0 + 0.3 * (d - 8.0))
+    cal = fit_calibration(d, gt, "piecewise")
+    just_below = cal.predict(np.array([cal.k - 1e-6]))[0]
+    just_above = cal.predict(np.array([cal.k + 1e-6]))[0]
+    assert abs(just_below - just_above) < 1e-3
+
+
+def test_piecewise_low_n_falls_back_to_linear():
+    d = np.array([1.0, 2.0, 3.0])
+    gt = 2.0 * d + 1.0
+    cal = fit_calibration(d, gt, "piecewise")
+    np.testing.assert_allclose(cal.predict(d), gt, rtol=1e-6)
+    assert cal.k == float("inf")
+
+
+def test_piecewise_leave_one_out_runs():
+    d = np.array([1.0, 2.0, 3.0, 4.0, 8.0, 9.0, 10.0, 11.0])
+    gt = np.where(d <= 5.0, 2.0 * d, 2.0 * 5.0 + 0.5 * (d - 5.0))
+    loo = leave_one_out(d, gt, "piecewise")
+    assert loo["loo_mae_cal"] is not None
+    assert loo["loo_mae_cal"] < loo["loo_mae_uncal"]
+
+
 def test_poly_single_point_falls_back():
     cal = fit_calibration(np.array([4.0]), np.array([8.0]), "poly", degree=2)
     assert abs(float(cal.predict(np.array([4.0]))[0]) - 8.0) < 1e-9  # scale through the point
