@@ -168,6 +168,31 @@ output dirs to have matching file counts — that's expected, not a bug. The
 results CSV also carries the subject centroid (`center_x`, `center_y`,
 `center_y_norm`).
 
+**Step 1.5 — benchmark methods before writing anything** (optional, CPU only,
+no torch): `scripts/benchmark_calibration.py` sweeps `--method`/`--degree`/
+`--robust`/`--anchor`/`--align`/`--ref-frame-method` combinations in one
+process and reports the same leave-one-out (LOO) metric as Step 2 for each —
+refit the calibrator on every point but one, predict the held-out point, and
+average that held-out error, so the reported accuracy reflects a frame the fit
+never saw rather than one it memorized. It never writes a `*_calib.npy` (there
+is no `--out-dir`/`--viz` on this script at all), so it's safe to sweep broadly
+before committing to a `--method` for Step 2:
+
+```bash
+python scripts/benchmark_calibration.py \
+  --results-csv outputs/smoke_results.csv \
+  --qc-flags data/qc_flags_annotations_20260709_with_fps.csv \
+  --depth-dir outputs/depth_orig --mask-dir outputs/masks \
+  --aligns none ransac --out-csv outputs/calibration_benchmark.csv
+```
+
+Writes one row per combination to `--out-csv` (mean LOO MAE uncalibrated vs.
+calibrated, mean improvement, % of groups improved, and the same
+close/medium/long distance-bucket breakdown as Step 2) and prints a ranked
+top-N table (`--sort-by improvement|mae_cal`) to the console. `--depth-dir`/
+`--mask-dir` here are read-only inputs (only needed when `--aligns` includes
+`ransac`, to re-derive Stage-1 alignment per group) — never written to.
+
 **Step 2 — fit calibration and write calibrated maps** (CPU only, no torch):
 
 ```bash
