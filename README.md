@@ -117,40 +117,85 @@ content is a direct check that the correct frame was extracted.
 
 The metric depth backends are residually mis-scaled per camera. Because each
 annotated frame gives one sparse `(predicted-depth-at-subject, true-distance)`
-point, we can fit a small **per-video** transform from that video's annotated
-frames and apply it to its depth maps — the inference-time, per-deployment idea
-from [`timmh/distance-estimation`](https://github.com/timmh/distance-estimation).
-This is a two-stage workflow so the cheap calibration can be re-run (different
-models) without re-running depth inference.
+point, we can fit a small **per-video** (or per-camera) transform from that
+video's annotated frames and apply it to its depth maps — the inference-time,
+per-deployment idea from
+[`timmh/distance-estimation`](https://github.com/timmh/distance-estimation).
+This is a three-step workflow — QC the annotations once, run the expensive
+depth/SAM-3 inference once, then fit/re-fit the cheap calibration as many times
+as you like — so switching `--method` or `--calib-level` never requires
+re-running inference.
 
-**Stage 1 — persist the original depth maps** (adds one flag to the eval run):
+**Step 0 — QC the annotations** (`scripts/qc_annotations.py`, pandas only, no
+torch): flags rows that are impossible under *any* annotation protocol —
+`frame_idx` inconsistent with the video's probed fps, timestamps past the
+video's end, videos missing from disk, and absurd (>100m by default) or
+non-positive distances. It never edits a `distance` value, only flags/drops
+rows — sequence-based heuristics (repeated values, implied speed, direction
+reversals) are deliberately *not* used, since videos are annotated by 2+
+people and sparsely, so such heuristics can't distinguish bugs from valid
+labels (see `scripts/qc_annotations.py`'s module docstring).
+
+```bash
+python scripts/qc_annotations.py data/annotations_20260709_with_fps.csv --fix
+```
+
+Writes `data/qc_flags_<basename>.csv` (one row per flagged `(video_name,
+frame_idx)`, with a `reason`) and, with `--fix`, `<basename>_clean.csv` (same
+rows minus `ABSURD_DISTANCE`/`ZERO_DISTANCE` ones, `frame_idx` recomputed from
+timestamp+fps). `data/annotations_06052026.csv` (CLAUDE.md's originally
+documented file, still `run_calibration_eval.py`'s default) predates this QC
+pass; `data/annotations_20260709_with_fps.csv` / `_clean.csv` are the newer,
+QC'd/fps-corrected generation — prefer the latter, and feed the resulting
+`qc_flags_*.csv` into Stage 2 below rather than re-running Stage 1 against it
+(Stage 1 is the expensive step; see Step 2).
+
+**Step 1 — persist the original depth maps** (adds flags to the eval run):
 
 ```bash
 python scripts/run_calibration_eval.py --device cuda --limit 40 \
   --output-csv outputs/smoke_results.csv \
-  --save-depth-dir outputs/depth_orig
+  --save-depth-dir outputs/depth_orig --save-mask-dir outputs/masks
 ```
 
-`--save-depth-dir` writes one fp16 `.npy` per frame
+`--save-depth-dir` writes one fp16 `.npy` per *decoded* frame
 (`<video_name>_frame<NNNNNN>_orig.npy`, keyed by the flat annotation name so it
-never collides across camera folders). The results CSV also now carries the
-subject centroid (`center_x`, `center_y`, `center_y_norm`).
+never collides across camera folders) — unconditionally, even if SAM-3 finds no
+detection in that frame. `--save-mask-dir` writes one `*_masks.json` per frame
+*only when SAM-3 detects the prompt* (`status=empty_mask` frames get no mask);
+required for `--align ransac` below. Because of this, don't expect the two
+output dirs to have matching file counts — that's expected, not a bug. The
+results CSV also carries the subject centroid (`center_x`, `center_y`,
+`center_y_norm`).
 
-**Stage 2 — fit per-video calibration and write calibrated maps** (CPU only,
-no torch):
+**Step 2 — fit calibration and write calibrated maps** (CPU only, no torch):
 
 ```bash
+# --qc-flags excludes annotation rows already flagged by Step 0 (e.g. a
+# handful of clips whose ground-truth distance is a data-entry typo, like
+# 401410m instead of ~10m) before fitting/reporting -- one bad point can send
+# a clip's small-n LOO fit to an extreme slope and swamp the aggregate MAE.
 python scripts/calibrate_depth.py \
   --results-csv outputs/smoke_results.csv \
   --depth-dir outputs/depth_orig --out-dir outputs/depth_calib \
-  --method linear --viz
+  --method linear --calib-level clip \
+  --qc-flags data/qc_flags_annotations_20260709_with_fps.csv --viz
 ```
 
-For every video it fits the chosen transform on that video's sparse points,
+For every group it fits the chosen transform on that group's sparse points,
 applies it to each saved map (`<...>_calib.npy`), and — with `--viz` — writes an
 `orig | calib` colourised PNG. It also writes `outputs/calibration_fits.csv`
-(per-video method, fitted params, and **leave-one-out** calibrated-vs-uncalibrated
-MAE) and prints an aggregate improvement summary.
+(per-group method, fitted params, and **leave-one-out** calibrated-vs-uncalibrated
+MAE), prints an aggregate improvement summary, and a breakdown of LOO MAE by
+ground-truth distance range (close 1-4m / medium 4-8m / long 8m+, pooled across
+all points) so accuracy at different ranges is visible, not just one number.
+
+| flag | purpose |
+|---|---|
+| `--calib-level {clip,cam}` | fit one calibrator per clip (default, e.g. one `DSCF0005.AVI`) or pool all clips under one camera-reference folder into a single fit (`cam`; needs `--video-list-xlsx`/`--data-dir`, both default to `data/`) |
+| `--qc-flags PATH` | exclude `(video_name, frame_idx)` rows flagged by Step 0's `qc_annotations.py` before fitting/reporting |
+| `--align {none,ransac}` | optional cross-frame background alignment (`scripts/alignment.py`) before calibration; default `none` since it isn't known ahead of time whether this helps on top of this dataset's already-joint depth inference — compare `calibration_fits.csv`'s `align_*` columns across runs to find out. Needs `--mask-dir` |
+| `--robust` | median-ratio / Theil-Sen fit for `scale`/`linear` instead of least-squares |
 
 `--method` selects the calibration model (`scripts/calibration.py`):
 
@@ -164,6 +209,7 @@ MAE) and prints an aggregate improvement summary.
 
 Omit `--depth-dir` to only fit and report leave-one-out MAE from the CSV (handy
 for quickly comparing methods before writing any maps). Re-run with a different
-`--method` on the same `--depth-dir` to compare without re-running inference.
+`--method`/`--calib-level`/`--qc-flags` on the same `--depth-dir` to compare
+without re-running inference.
 
 Unit tests for the calibration maths: `python scripts/test_calibration.py`.

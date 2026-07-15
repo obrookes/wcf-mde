@@ -94,6 +94,13 @@ def parse_args() -> argparse.Namespace:
                    help="skip Stage-1 alignment for a group with fewer than this many points "
                         "and fall back to unaligned pred -- a handful of points is more likely "
                         "to be hurt than helped by fitting an extra affine on top")
+    p.add_argument("--qc-flags", type=Path, default=None,
+                   help="optional scripts/qc_annotations.py flags CSV; any (video_name, "
+                        "frame_idx) present there is excluded before fitting/reporting, e.g. "
+                        "a handful of clips carry a data-entry-typo ground-truth distance "
+                        "(hundreds/thousands of metres) that wrecks their small-n LOO fit and "
+                        "dominates the aggregate summary -- see "
+                        "data/qc_flags_annotations_20260709_with_fps.csv")
     args = p.parse_args()
     if args.align != "none" and args.mask_dir is None:
         p.error("--align requires --mask-dir (per-instance masks saved by "
@@ -124,10 +131,19 @@ def build_camera_key_fn(video_list_xlsx: Path, data_dir: Path) -> Callable[[str]
     return camera_key
 
 
+def load_qc_exclusions(qc_flags_csv: Path) -> set[tuple[str, int]]:
+    """(video_name, frame_idx) pairs to drop, read from a scripts/qc_annotations.py flags CSV
+    (one row per flagged (annotation row, reason) -- any presence there is disqualifying, so
+    reasons aren't distinguished here)."""
+    with open(qc_flags_csv, newline="") as f:
+        return {(row["video_name"], int(row["frame_idx"])) for row in csv.DictReader(f)}
+
+
 def load_points(
     results_csv: Path,
     anchor: str,
     group_key_fn: Callable[[str], str] | None = None,
+    exclude: set[tuple[str, int]] | None = None,
 ) -> dict[str, list[dict]]:
     """Group processed frames into sparse calibration points, keyed by `group_key_fn(video_name)`
     (default: identity, i.e. one group per clip -- pass build_camera_key_fn(...)'s result for
@@ -151,6 +167,8 @@ def load_points(
                 continue
             video_name = row["video_name"]
             frame_idx = int(row["frame_idx"])
+            if exclude is not None and (video_name, frame_idx) in exclude:
+                continue
             raw_instance_idx = row.get("instance_idx")
             instance_idx = int(raw_instance_idx) if raw_instance_idx not in (None, "", "None") else None
             key = (video_name, frame_idx, instance_idx)
@@ -286,7 +304,11 @@ def main() -> None:
     group_key_fn = None
     if args.calib_level == "cam":
         group_key_fn = build_camera_key_fn(args.video_list_xlsx, args.data_dir)
-    groups = load_points(args.results_csv, args.anchor, group_key_fn=group_key_fn)
+    exclude = None
+    if args.qc_flags is not None:
+        exclude = load_qc_exclusions(args.qc_flags)
+        print(f"loaded {len(exclude)} QC-flagged (video_name, frame_idx) exclusions from {args.qc_flags}")
+    groups = load_points(args.results_csv, args.anchor, group_key_fn=group_key_fn, exclude=exclude)
     group_keys = sorted(groups)
     if args.limit_videos is not None:
         group_keys = group_keys[:args.limit_videos]
@@ -304,6 +326,9 @@ def main() -> None:
     fit_rows: list[dict] = []
     agg_uncal: list[float] = []
     agg_cal: list[float] = []
+    dist_gt: list[float] = []
+    dist_uncal: list[float] = []
+    dist_cal: list[float] = []
 
     for group_key in group_keys:
         pts = groups[group_key]
@@ -349,6 +374,9 @@ def main() -> None:
             improvement = loo["loo_mae_uncal"] - loo["loo_mae_cal"]
             agg_uncal.append(loo["loo_mae_uncal"])
             agg_cal.append(loo["loo_mae_cal"])
+            dist_gt.extend(loo["loo_gt"])
+            dist_uncal.extend(loo["loo_residuals_uncal"])
+            dist_cal.extend(loo["loo_residuals"])
         fit_rows.append({
             "calib_level": args.calib_level,
             "group_key": group_key,
@@ -409,21 +437,52 @@ def main() -> None:
         writer.writerows(fit_rows)
     print(f"wrote {len(fit_rows)} per-video fits to {args.fits_csv}")
 
-    print_summary(args.method, agg_uncal, agg_cal, fit_rows)
+    print_summary(args.method, args.calib_level, agg_uncal, agg_cal, fit_rows)
+    print_distance_summary(dist_gt, dist_uncal, dist_cal)
 
 
-def print_summary(method: str, agg_uncal: list[float], agg_cal: list[float], fit_rows: list[dict]) -> None:
+def print_summary(method: str, calib_level: str, agg_uncal: list[float], agg_cal: list[float],
+                   fit_rows: list[dict]) -> None:
+    unit = "cameras" if calib_level == "cam" else "videos"
     n_scored = len(agg_cal)
     print(f"\n--- leave-one-out summary ({method}) ---")
-    print(f"  videos with >= enough frames for LOO: {n_scored} / {len(fit_rows)}")
+    print(f"  {unit} with >= enough frames for LOO: {n_scored} / {len(fit_rows)}")
     if n_scored:
         mu, mc = float(np.mean(agg_uncal)), float(np.mean(agg_cal))
         improved = sum(1 for u, c in zip(agg_uncal, agg_cal) if c < u)
         print(f"  mean uncalibrated LOO MAE: {mu:.3f} m")
         print(f"  mean calibrated   LOO MAE: {mc:.3f} m")
-        print(f"  mean improvement:          {mu - mc:+.3f} m  ({improved}/{n_scored} videos improved)")
+        print(f"  mean improvement:          {mu - mc:+.3f} m  ({improved}/{n_scored} {unit} improved)")
     else:
-        print("  (no video had enough annotated frames to leave one out for this method)")
+        print(f"  (no {unit[:-1]} had enough annotated frames to leave one out for this method)")
+
+
+DISTANCE_BUCKETS = [(1.0, 4.0, "close 1-4m"), (4.0, 8.0, "medium 4-8m"), (8.0, float("inf"), "long 8m+")]
+
+
+def print_distance_summary(gt: list[float], uncal_res: list[float], cal_res: list[float]) -> None:
+    """LOO MAE by ground-truth distance range, pooled across every LOO'd point (not
+    per-video) -- one video's points can land in several buckets."""
+    print("\n--- LOO MAE by distance range (pooled points) ---")
+    if not gt:
+        print("  (no LOO points to bucket)")
+        return
+    gt_arr = np.asarray(gt, dtype=np.float64)
+    uncal_arr = np.asarray(uncal_res, dtype=np.float64)
+    cal_arr = np.asarray(cal_res, dtype=np.float64)
+    bucketed = np.zeros_like(gt_arr, dtype=bool)
+    for lo, hi, label in DISTANCE_BUCKETS:
+        mask = (gt_arr >= lo) & (gt_arr < hi)
+        bucketed |= mask
+        n = int(mask.sum())
+        if n == 0:
+            print(f"  {label:<14} n=0")
+            continue
+        print(f"  {label:<14} n={n:<5} uncal MAE={uncal_arr[mask].mean():.3f} m   "
+              f"cal MAE={cal_arr[mask].mean():.3f} m")
+    n_below = int((~bucketed).sum())
+    if n_below:
+        print(f"  (note: {n_below} point(s) with ground-truth distance < 1m fall outside all buckets)")
 
 
 if __name__ == "__main__":
