@@ -238,3 +238,28 @@ for quickly comparing methods before writing any maps). Re-run with a different
 without re-running inference.
 
 Unit tests for the calibration maths: `python scripts/test_calibration.py`.
+
+**Exporting calibrated depth maps + frames** (`scripts/export_calibrated.py`,
+CPU only): bundles Step 2's `*_calib.npy` maps with their source video frames
+into a paired dataset, keeping only QC-valid frames — any `(video_name,
+frame_idx)` present in the Step 0 flags CSV is dropped, whether or not Step 2
+was run with `--qc-flags`.
+
+```bash
+python scripts/export_calibrated.py \
+  --calib-dir outputs/depth_calib --out-dir outputs/export
+```
+
+writes:
+
+```
+outputs/export/
+  depth_maps/{video_name}_frame{idx:06d}_calib.npy   # copied as-is (fp16)
+  frames/{video_name}_frame{idx:06d}.png             # re-decoded from the source video
+```
+
+Frames aren't persisted anywhere by the pipeline, so they are re-decoded from
+the videos under `data/` (via `list_reference_videos.xlsx`). The two dirs stay
+strictly 1:1: a frame that fails to resolve or decode drops its depth map too.
+`--frame-format jpg` trades losslessness for size; `--qc-flags` overrides the
+default `data/qc_flags_annotations_20260709_with_fps.csv`.
