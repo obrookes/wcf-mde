@@ -41,6 +41,11 @@ from scripts.alignment import (
     pick_reference_frame,
 )
 from scripts.masks import load_instance_masks
+from scripts.qc_exclusions import build_exclusions
+# `load_qc_exclusions` used to live here; re-exported so any existing caller importing it from
+# this module keeps working. Prefer build_exclusions/resolve_exclusions -- the bare frame-idx
+# join under-matches against a *_clean.csv (see scripts/qc_exclusions.py).
+from scripts.qc_exclusions import load_qc_exclusions  # noqa: F401
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -101,6 +106,13 @@ def parse_args() -> argparse.Namespace:
                         "(hundreds/thousands of metres) that wrecks their small-n LOO fit and "
                         "dominates the aggregate summary -- see "
                         "data/qc_flags_annotations_20260709_with_fps.csv")
+    p.add_argument("--annotations-csv", type=Path,
+                   default=REPO_ROOT / "data" / "annotations_20260709_with_fps_clean.csv",
+                   help="the annotations CSV Stage 1 was run against; only used with --qc-flags, "
+                        "to resolve flagged rows into THAT file's frame_idx space. The flags CSV "
+                        "carries the pre-fix frame_idx, so joining it directly against a "
+                        "*_clean.csv (whose frame_idx is recomputed from timestamp x fps) "
+                        "silently under-excludes -- see scripts/qc_exclusions.py")
     args = p.parse_args()
     if args.align != "none" and args.mask_dir is None:
         p.error("--align requires --mask-dir (per-instance masks saved by "
@@ -129,14 +141,6 @@ def build_camera_key_fn(video_list_xlsx: Path, data_dir: Path) -> Callable[[str]
         return str(path.parent.relative_to(data_dir))
 
     return camera_key
-
-
-def load_qc_exclusions(qc_flags_csv: Path) -> set[tuple[str, int]]:
-    """(video_name, frame_idx) pairs to drop, read from a scripts/qc_annotations.py flags CSV
-    (one row per flagged (annotation row, reason) -- any presence there is disqualifying, so
-    reasons aren't distinguished here)."""
-    with open(qc_flags_csv, newline="") as f:
-        return {(row["video_name"], int(row["frame_idx"])) for row in csv.DictReader(f)}
 
 
 def load_points(
@@ -306,8 +310,7 @@ def main() -> None:
         group_key_fn = build_camera_key_fn(args.video_list_xlsx, args.data_dir)
     exclude = None
     if args.qc_flags is not None:
-        exclude = load_qc_exclusions(args.qc_flags)
-        print(f"loaded {len(exclude)} QC-flagged (video_name, frame_idx) exclusions from {args.qc_flags}")
+        exclude = build_exclusions(args.qc_flags, args.annotations_csv)
     groups = load_points(args.results_csv, args.anchor, group_key_fn=group_key_fn, exclude=exclude)
     group_keys = sorted(groups)
     if args.limit_videos is not None:

@@ -561,6 +561,26 @@ def main() -> None:
             **fields,
         }
 
+    # The output CSV is opened here -- after the models have loaded, before the expensive loop --
+    # and flushed once per video rather than written in one go at the end. Masks and depth maps
+    # are already persisted incrementally, so without this a job killed at its wall clock (this
+    # pipeline runs under SLURM) would leave every expensive artifact on disk but lose the
+    # `status` column, which is the source of truth for which frames produced a mask, forcing a
+    # full re-run. Opening it *after* model loading means a failure to load weights leaves any
+    # previous run's CSV intact instead of truncating it on startup. Same final file either way.
+    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
+    out_file = open(args.output_csv, "w", newline="")
+    writer = csv.DictWriter(out_file, fieldnames=OUTPUT_FIELDS)
+    writer.writeheader()
+    for result in results:  # the video_missing rows gathered while grouping, above
+        writer.writerow(result)
+    out_file.flush()
+
+    def emit(result: dict) -> None:
+        """Record a result row both in memory (for print_summary) and on disk (for crash safety)."""
+        results.append(result)
+        writer.writerow(result)
+
     n_done = 0
     for video_path, row_indices in groups.items():
         frame_indices = [rows[i]["frame_idx"] for i in row_indices]
@@ -613,7 +633,7 @@ def main() -> None:
                 )
                 for i in idx_to_row_indices[frame_idx]:
                     for fields in frame_fields_list:
-                        results.append(row_dict(i, fields))
+                        emit(row_dict(i, fields))
                     filled.add(i)
 
                 n_done += 1
@@ -625,15 +645,14 @@ def main() -> None:
                             "depth_mask_mean": None, "depth_centroid": None}
             for i in row_indices:
                 if i not in filled:
-                    results.append(row_dict(i, error_fields))
+                    emit(row_dict(i, error_fields))
                     filled.add(i)
+        finally:
+            # one flush per video, not per row: bounds the loss from a kill to the video in
+            # flight without paying an fsync-ish cost on every instance
+            out_file.flush()
 
-    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS)
-        writer.writeheader()
-        for r in results:
-            writer.writerow(r)
+    out_file.close()
     print(f"wrote {len(results)} rows to {args.output_csv}")
 
     print_summary(results)

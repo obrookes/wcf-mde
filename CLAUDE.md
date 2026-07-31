@@ -4,12 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-`wcf-mde` is a **data-only repository** — there is no application source code, build system,
-linter, or test suite. It holds Wild Chimpanzee Foundation camera-trap reference videos and
-ground-truth distance annotations, presumably for a monocular distance-estimation (MDE) effort
-(estimating subject-to-camera distance from single-camera footage). Don't go looking for
-build/lint/test commands or an "architecture" — there isn't one; the work here is about the
-dataset itself.
+`wcf-mde` holds Wild Chimpanzee Foundation camera-trap reference videos and ground-truth
+distance annotations for a monocular distance-estimation (MDE) effort — estimating
+subject-to-camera distance from single-camera footage — **plus the pipeline that evaluates and
+calibrates it**. Read `README.md` for the pipeline; this file covers the dataset layout.
+
+There is still no build system or linter, but there *is* a test suite: plain `test_*.py` files
+under `scripts/` and `scripts/qa/`, each runnable directly (`python scripts/test_calibration.py`)
+and pytest-compatible, with no GPU, data, torch, network or API key needed.
+
+```bash
+for t in scripts/test_*.py scripts/qa/test_*.py; do python "$t"; done
+```
+
+The heavy stages need a CUDA GPU and the `dap-3_py3-11` conda env (see `README.md`); everything
+under `scripts/qa/` except Stage 1 is CPU-only.
 
 ## Layout
 
@@ -53,4 +62,12 @@ video_name, frame_idx, frame_timestamp, distance
 path). `frame_timestamp` is in seconds; `distance` is the annotated subject-to-camera distance
 at that frame. Row counts per site (by `video_name` prefix): pnt 6017, pss 2353, fello 1453,
 kora 934, mafou 710, mbnp 701, beauvois 290 — `pnt` and `pss` are by far the most densely
-annotated sites.
+annotated sites. (Those prefixes come from `scripts/sites.py::site_of`, which splits on the
+first underscore — so the `fello_sounga` site appears as `fello`.)
+
+**This is the older generation.** Its `frame_idx` values are inconsistent with the videos'
+probed fps, so a frame extracted by index may not be the frame that was annotated. Prefer
+`data/annotations_20260709_with_fps_clean.csv`, produced by `scripts/qc_annotations.py --fix`,
+which recomputes `frame_idx` from `frame_timestamp × fps` and drops impossible rows. It remains
+`run_calibration_eval.py`'s default only for backwards compatibility — see README.md Step 0,
+including the note on why the flags CSV cannot be joined to the clean CSV on `frame_idx`.

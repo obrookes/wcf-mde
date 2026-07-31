@@ -30,16 +30,16 @@ With --fix, additionally writes <input>_clean.csv (original never modified):
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from scripts.sites import site_of  # noqa: F401,E402 - re-exported; callers import it from here
+
 DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
-
-
-def site_of(video_name: str) -> str:
-    return video_name.split("_", 1)[0]
 
 
 def collect_flags(df: pd.DataFrame, fps_table: pd.DataFrame,
