@@ -28,7 +28,7 @@ from pathlib import Path
 import cv2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from scripts.calibrate_depth import load_qc_exclusions
+from scripts.calibrate_depth import build_exclusions
 from scripts.frame_source import iter_frames_at_indices
 from scripts.video_lookup import load_anno_to_path
 
@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
                    default=REPO_ROOT / "data" / "qc_flags_annotations_20260709_with_fps.csv",
                    help="scripts/qc_annotations.py flags CSV; any (video_name, frame_idx) "
                         "present there is excluded from the export")
+    p.add_argument("--annotations-csv", type=Path,
+                   default=REPO_ROOT / "data" / "annotations_20260709_with_fps_clean.csv",
+                   help="the annotations CSV Stage 1 was run against, used to resolve --qc-flags "
+                        "into that file's frame_idx space (the *_calib.npy names key on it). "
+                        "See scripts/qc_exclusions.py for why a direct frame_idx join under-matches")
     p.add_argument("--out-dir", type=Path, required=True,
                    help="export root; depth_maps/ and frames/ are created underneath")
     p.add_argument("--video-list", type=Path, default=REPO_ROOT / "data" / "list_reference_videos.xlsx",
@@ -63,8 +68,7 @@ def main() -> None:
     if not calib_paths:
         sys.exit(f"no *_calib.npy files found in {args.calib_dir}")
 
-    exclude = load_qc_exclusions(args.qc_flags)
-    print(f"loaded {len(exclude)} QC-flagged (video_name, frame_idx) exclusions from {args.qc_flags}")
+    exclude = build_exclusions(args.qc_flags, args.annotations_csv)
 
     # (video_name, frame_idx) -> calib map path, QC-flagged maps dropped up front
     by_video: dict[str, dict[int, Path]] = defaultdict(dict)

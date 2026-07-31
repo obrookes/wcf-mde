@@ -33,9 +33,9 @@ from scripts.calibration import METHODS, fit_calibration, leave_one_out
 from scripts.calibrate_depth import (
     DISTANCE_BUCKETS,
     build_camera_key_fn,
+    build_exclusions,
     compute_aligned_preds,
     load_points,
-    load_qc_exclusions,
 )
 from scripts.alignment import REFERENCE_METHODS
 
@@ -52,6 +52,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--qc-flags", type=Path, default=None,
                    help="optional scripts/qc_annotations.py flags CSV; same semantics as "
                         "calibrate_depth.py --qc-flags")
+    p.add_argument("--annotations-csv", type=Path,
+                   default=REPO_ROOT / "data" / "annotations_20260709_with_fps_clean.csv",
+                   help="the annotations CSV Stage 1 was run against; same semantics as "
+                        "calibrate_depth.py --annotations-csv (only used with --qc-flags)")
     p.add_argument("--calib-level", choices=["clip", "cam"], default="clip")
     p.add_argument("--video-list-xlsx", type=Path, default=REPO_ROOT / "data" / "list_reference_videos.xlsx",
                    help="only needed for --calib-level cam")
@@ -211,8 +215,7 @@ def main() -> None:
         group_key_fn = build_camera_key_fn(args.video_list_xlsx, args.data_dir)
     exclude = None
     if args.qc_flags is not None:
-        exclude = load_qc_exclusions(args.qc_flags)
-        print(f"loaded {len(exclude)} QC-flagged (video_name, frame_idx) exclusions from {args.qc_flags}")
+        exclude = build_exclusions(args.qc_flags, args.annotations_csv)
 
     rows: list[dict] = []
     for anchor in args.anchors:
