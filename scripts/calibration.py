@@ -394,4 +394,6 @@ def leave_one_out(
         "loo_mae_cal": float(np.mean(residuals)),
         "loo_mae_uncal": uncal_mae,
         "loo_residuals": residuals,
+        "loo_residuals_uncal": np.abs(pred - gt).tolist(),
+        "loo_gt": gt.tolist(),
     }
