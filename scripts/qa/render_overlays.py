@@ -70,6 +70,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--video-list-xlsx", type=Path,
                    default=REPO_ROOT / "data" / "list_reference_videos.xlsx")
     p.add_argument("--data-dir", type=Path, default=REPO_ROOT / "data")
+    p.add_argument("--frames-dir", type=Path, default=None,
+                   help="read frames from exported PNGs (<video_name>_frame%%06d.png, as written "
+                        "by export_calibrated.py) instead of decoding the source videos; use when "
+                        "the videos are not on this machine")
     p.add_argument("--dispositions", nargs="+", default=["vision"],
                    help="which pre-filter dispositions to render. Defaults to the ones that go "
                         "to a model; add 'pass'/'fail' to render the gold-set slices too")
@@ -247,7 +251,7 @@ def main() -> None:
         sys.exit(f"no rows with disposition in {args.dispositions}; nothing to render")
     print(f"{len(targets)} instances to render (dispositions: {', '.join(args.dispositions)})")
 
-    anno_to_path = load_anno_to_path(args.video_list_xlsx, args.data_dir)
+    anno_to_path = None if args.frames_dir else load_anno_to_path(args.video_list_xlsx, args.data_dir)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     # group by video so each is decoded once for all of its requested frames -- decoding is
@@ -260,23 +264,26 @@ def main() -> None:
     n_written = n_failed = 0
     for video_name in sorted(by_video):
         group = by_video[video_name]
-        try:
-            video_path = resolve_video_path(video_name, anno_to_path)
-        except (KeyError, FileNotFoundError) as exc:
-            print(f"  !! {video_name}: {exc}")
-            n_failed += len(group)
-            continue
-
         by_frame: dict[int, list[dict]] = defaultdict(list)
         for target in group:
             by_frame[target["frame_idx"]].append(target)
 
-        try:
-            frames = list(iter_frames_at_indices(video_path, sorted(by_frame)))
-        except OSError as exc:
-            print(f"  !! {video_name}: {exc}")
-            n_failed += len(group)
-            continue
+        if args.frames_dir is not None:
+            frames = [(idx, cv2.imread(str(args.frames_dir / f"{video_name}_frame{idx:06d}.png")))
+                      for idx in sorted(by_frame)]
+        else:
+            try:
+                video_path = resolve_video_path(video_name, anno_to_path)
+            except (KeyError, FileNotFoundError) as exc:
+                print(f"  !! {video_name}: {exc}")
+                n_failed += len(group)
+                continue
+            try:
+                frames = list(iter_frames_at_indices(video_path, sorted(by_frame)))
+            except OSError as exc:
+                print(f"  !! {video_name}: {exc}")
+                n_failed += len(group)
+                continue
 
         for frame_idx, frame_bgr in frames:
             wanted = by_frame.get(frame_idx, [])
