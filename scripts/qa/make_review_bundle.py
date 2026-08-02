@@ -3,9 +3,9 @@
 review runs on a laptop instead of through an SSH tunnel to the login node.
 
 Collects, for every flagged-bad verdict row (same queue rule as review_server.py): the raw
-frame PNG, the mask JSON, and the triage overlay panel; plus the verdicts CSV (bad rows only,
-overlay paths rewritten bundle-relative), the server code itself, a `run_review.py` launcher,
-a requirements.txt and a README. The result extracts to `review_bundle/` and runs with:
+frame PNG and the mask JSON (the UI renders all its views from those two); plus the verdicts
+CSV (bad rows only), the server code itself, a `run_review.py` launcher, a requirements.txt
+and a README. The result extracts to `review_bundle/` and runs with:
 
     pip install -r requirements.txt
     python run_review.py            # then open http://localhost:8765
@@ -77,8 +77,10 @@ Everything needed to review the Haiku-flagged masks, offline, on your own machin
 2.  python run_review.py                 (add --port N if 8765 is taken)
 3.  open http://localhost:8765
 
-Keys: a accept as-is, f accept auto-fix, b save drawn box, d discard, s skip,
-arrows navigate, Esc clears the box.
+Tabs show the original SAM-3 mask on the frame (default), an auto-fix preview, a zoom
+crop, and the raw frame (keys 1-4). Actions are buttons (with shortcuts): Mask is fine
+(a), Accept auto-fix (f), Draw box (b: drag on the image, then Enter to save), Discard
+(d), Skip (s); arrows navigate, Esc cancels drawing.
 
 Every keypress appends to corrections.csv in this directory immediately — you can stop
 and restart run_review.py at any time and it resumes; re-deciding a key is fine (the
@@ -107,10 +109,10 @@ def stage_bundle(rows: list[dict], frames_dir: Path, masks_dir: Path, stage: Pat
     if not queue:
         raise SystemExit("queue is empty — nothing to bundle")
 
-    for sub in ("frames", "masks", "overlays"):
+    for sub in ("frames", "masks"):
         (stage / sub).mkdir(parents=True, exist_ok=True)
     missing: list[tuple[str, str]] = []
-    n_frames = n_masks = n_overlays = 0
+    n_frames = n_masks = 0
 
     def copy(kind: str, src: Path, dst: Path) -> bool:
         nonlocal missing
@@ -129,10 +131,8 @@ def stage_bundle(rows: list[dict], frames_dir: Path, masks_dir: Path, stage: Pat
         n_frames += copy("frame", frames_dir / fname, stage / "frames" / fname)
         msrc = mask_path(masks_dir, video, frame)
         n_masks += copy("mask", msrc, stage / "masks" / msrc.name)
-        overlay = Path(item.get("overlay_path", ""))
-        rel = f"overlays/{overlay.name}"
-        n_overlays += copy("overlay", overlay, stage / rel)
-        out_rows.append({**item, "overlay_path": rel})
+        # overlay panels are not bundled: the UI renders every view from frame + mask JSON
+        out_rows.append({**item, "overlay_path": ""})
 
     with open(stage / "verdicts.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(out_rows[0].keys()))
@@ -148,7 +148,7 @@ def stage_bundle(rows: list[dict], frames_dir: Path, masks_dir: Path, stage: Pat
     (stage / "README.txt").write_text(README)
 
     return {"queue": len(queue), "frames": n_frames, "masks": n_masks,
-            "overlays": n_overlays, "missing": missing}
+            "missing": missing}
 
 
 def parse_args() -> argparse.Namespace:
@@ -174,7 +174,7 @@ def main() -> None:
         stage = Path(td) / "review_bundle"
         stats = stage_bundle(rows, args.frames_dir, args.masks_dir, stage, args.only_class)
         print(f"queue {stats['queue']}: staged {stats['frames']} frames, "
-              f"{stats['masks']} mask JSONs, {stats['overlays']} overlays")
+              f"{stats['masks']} mask JSONs")
         if stats["missing"]:
             for kind, path in stats["missing"]:
                 print(f"  !! missing {kind}: {path}", file=sys.stderr)

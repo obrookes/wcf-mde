@@ -12,9 +12,11 @@ see the bundle's README.txt). It can also run on the login node through an SSH t
     # laptop:  ssh -L 8765:localhost:8765 <login-node>  ->  http://localhost:8765
 
 The queue is every verdict row with `result_type=succeeded` and `verdict != ok`, grouped by
-failure class. For each mask the page shows the pilot overlay panel, the raw exported frame
-(drag on it to draw a correction box), and a deterministic morphology auto-fix preview
-(largest connected component + hole fill). One keypress appends a decision row to the
+failure class. For each mask the page shows ONE large image with tabs: the original SAM-3
+mask rendered on the frame (green = the instance under review, yellow = other instances in
+the frame), a deterministic morphology auto-fix preview (largest connected component + hole
+fill), a zoomed crop of the mask region, and the raw frame. Correction boxes are drawn in an
+explicit draw mode (Draw box button → drag → Save). One decision appends a row to the
 corrections CSV — flushed per write, so killing the server loses nothing and restarting
 resumes where you left off (re-deciding a key appends again; last write wins downstream).
 
@@ -153,6 +155,52 @@ def render_autofix_panel(frame_bgr: np.ndarray, before: np.ndarray,
     return out
 
 
+def render_mask_panel(frame_bgr: np.ndarray, target: np.ndarray,
+                      siblings: list[np.ndarray] | None = None) -> np.ndarray:
+    """The mask exactly as SAM-3 produced it: target instance as green fill + contour, any
+    other instances in the frame as thin yellow contours for context (split/multiple calls
+    need to see the neighbours)."""
+    out = frame_bgr.copy()
+    for sib in siblings or []:
+        cnts, _ = cv2.findContours(sib.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(out, cnts, -1, (0, 220, 255), 1)
+    t = target.astype(bool)
+    green = np.zeros_like(out)
+    green[:] = (0, 200, 0)
+    out[t] = (0.55 * out[t] + 0.45 * green[t]).astype(np.uint8)
+    cnts, _ = cv2.findContours(target.astype(np.uint8), cv2.RETR_EXTERNAL,
+                               cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(out, cnts, -1, (0, 255, 0), 2)
+    return out
+
+
+def zoom_bbox(mask: np.ndarray, margin: float = 0.4,
+              min_half: int = 60) -> tuple[int, int, int, int]:
+    """Square-ish crop window around the mask's bbox with breathing room, clamped to the
+    image; the full image if the mask is empty."""
+    h, w = mask.shape[:2]
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return 0, 0, w, h
+    cx, cy = (int(xs.min()) + int(xs.max())) // 2, (int(ys.min()) + int(ys.max())) // 2
+    half = max(int(max(xs.max() - xs.min(), ys.max() - ys.min()) * (1 + margin) / 2),
+               min_half)
+    x0, x1 = max(0, cx - half), min(w, cx + half)
+    y0, y1 = max(0, cy - half), min(h, cy + half)
+    return x0, y0, x1, y1
+
+
+def render_zoom_panel(rendered: np.ndarray, mask: np.ndarray,
+                      out_width: int = 720, max_scale: int = 4) -> np.ndarray:
+    """Crop an already-rendered panel to the mask region and upscale with nearest-neighbour
+    so the true mask-edge pixels stay visible."""
+    x0, y0, x1, y1 = zoom_bbox(mask)
+    crop = rendered[y0:y1, x0:x1]
+    scale = min(max_scale, max(1, out_width // max(1, crop.shape[1])))
+    return cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+
+
 # --------------------------------------------------------------------------------------
 # server
 # --------------------------------------------------------------------------------------
@@ -171,13 +219,23 @@ class ReviewApp:
         return self.frames_dir / frame_filename(item["video_name"], item["frame_idx"])
 
     def instance_mask(self, item: dict) -> np.ndarray:
+        target, _ = self.frame_masks(item)
+        return target
+
+    def frame_masks(self, item: dict) -> tuple[np.ndarray, list[np.ndarray]]:
+        """(target instance mask, other instances in the same frame)."""
         instances = load_instance_masks(self.masks_dir, item["video_name"],
                                         int(item["frame_idx"]))
         want = int(item["instance_idx"])
+        target, siblings = None, []
         for inst in instances:
             if inst["instance_idx"] == want:
-                return inst["mask"]
-        raise KeyError(f"instance {want} not in mask JSON for {key_of(item)}")
+                target = inst["mask"]
+            else:
+                siblings.append(inst["mask"])
+        if target is None:
+            raise KeyError(f"instance {want} not in mask JSON for {key_of(item)}")
+        return target, siblings
 
     def item_json(self, i: int, item: dict) -> dict:
         return {
@@ -264,9 +322,29 @@ class Handler(BaseHTTPRequestHandler):
                     "decisions": app.decisions,
                     "classes": BAD_CLASSES,
                 })
-            elif self.path.startswith("/overlay/"):
-                item = self._item("/overlay/")
-                self._png(cv2.imread(item["overlay_path"]) if item else None)
+            elif self.path.startswith("/mask/"):
+                item = self._item("/mask/")
+                if item is None:
+                    self._png(None)
+                    return
+                frame = cv2.imread(str(app.frame_path(item)))
+                if frame is None:
+                    self._png(None)
+                    return
+                target, siblings = app.frame_masks(item)
+                self._png(render_mask_panel(frame, target, siblings))
+            elif self.path.startswith("/zoom/"):
+                item = self._item("/zoom/")
+                if item is None:
+                    self._png(None)
+                    return
+                frame = cv2.imread(str(app.frame_path(item)))
+                if frame is None:
+                    self._png(None)
+                    return
+                target, siblings = app.frame_masks(item)
+                self._png(render_zoom_panel(render_mask_panel(frame, target, siblings),
+                                            target))
             elif self.path.startswith("/frame/"):
                 item = self._item("/frame/")
                 self._png(cv2.imread(str(app.frame_path(item))) if item else None)
@@ -321,58 +399,96 @@ PAGE = """<!doctype html>
   body { font-family: system-ui, sans-serif; margin: 0; background: #16181c; color: #dde;
          font-size: 14px; }
   header { display: flex; gap: 1.2em; align-items: baseline; padding: .5em 1em;
-           background: #22252b; position: sticky; top: 0; }
+           background: #22252b; position: sticky; top: 0; z-index: 2; }
   header .prog { font-weight: 600; }
-  #meta { padding: .4em 1em; color: #aab; }
-  #meta .verdict { padding: .1em .5em; border-radius: 3px; background: #7c2d2d; color: #fff;
-                   font-weight: 600; margin-right: .6em; }
-  .done { color: #6c6; font-weight: 600; margin-left: .6em; }
-  main { padding: 0 1em 5em; max-width: 1180px; }
-  .imgs img { max-width: 100%; display: block; background: #000; }
-  .pair { display: flex; gap: 8px; margin-top: 8px; }
-  .pair > div { flex: 1; min-width: 0; }
-  .cap { color: #889; font-size: 12px; margin: 2px 0; }
-  #framewrap { position: relative; }
-  #boxcanvas { position: absolute; inset: 0; cursor: crosshair; }
+  main { padding: 0 1em 2em; max-width: 1100px; margin: 0 auto; }
+  #info { display: flex; gap: .8em; align-items: baseline; flex-wrap: wrap;
+          padding: .6em .8em; margin: .8em 0 .4em; background: #22252b;
+          border-radius: 6px; }
+  #info .verdict { padding: .15em .6em; border-radius: 3px; background: #7c2d2d;
+                   color: #fff; font-weight: 600; text-transform: uppercase;
+                   font-size: 12px; letter-spacing: .04em; }
+  #info .conf { color: #9ab; }
+  #info .rationale { color: #ccd; flex: 1 1 22em; }
+  #info .flags { color: #667; font-size: 12px; }
+  .done { color: #6c6; font-weight: 600; }
+  .tabs { display: flex; gap: 4px; margin-top: .6em; }
+  .tabs button { background: #22252b; color: #9ab; border: 1px solid #333;
+                 border-bottom: none; border-radius: 6px 6px 0 0; padding: .4em .9em;
+                 cursor: pointer; font: inherit; }
+  .tabs button.active { background: #2c313a; color: #fff; font-weight: 600; }
+  #cap { color: #99a; font-size: 12px; padding: .4em .6em; background: #2c313a; }
+  #imgwrap { position: relative; background: #000; border-radius: 0 0 6px 6px;
+             overflow: hidden; }
+  #view { max-width: 100%; display: block; }
+  #boxcanvas { position: absolute; inset: 0; cursor: crosshair; display: none; }
+  #drawhint { display: none; background: #4a4022; color: #ffe8a0; padding: .45em .8em;
+              border-radius: 4px; margin: .5em 0; }
+  .actions { display: flex; gap: .5em; flex-wrap: wrap; align-items: center;
+             margin: .8em 0 .4em; }
+  .actions button { font: inherit; padding: .5em .9em; border-radius: 5px;
+                    border: 1px solid #444; background: #262a31; color: #dde;
+                    cursor: pointer; }
+  .actions button:hover { background: #313743; }
+  .actions button kbd { margin-left: .5em; }
+  .actions .accept  { border-color: #2d6a2d; }
+  .actions .fix     { border-color: #2d5a7c; }
+  .actions .draw    { border-color: #8a7326; }
+  .actions .draw.on { background: #8a7326; color: #fff; }
+  .actions .save    { background: #8a7326; color: #fff; display: none; }
+  .actions .discard { border-color: #7c2d2d; }
+  .actions .nav { margin-left: auto; }
   #notes { width: 24em; background: #22252b; color: #dde; border: 1px solid #444;
-           padding: .3em; }
-  #msg { color: #fa5; min-height: 1.2em; padding: .2em 1em; }
-  .keys { color: #778; padding: .4em 1em 1em; }
-  kbd { background: #333; border-radius: 3px; padding: 0 .4em; }
+           padding: .35em; border-radius: 4px; }
+  #msg { color: #fa5; min-height: 1.2em; padding: .2em 0; }
+  kbd { background: #333; border-radius: 3px; padding: 0 .4em; font-size: 12px; }
   select { background: #22252b; color: #dde; border: 1px solid #444; }
+  .legend { color: #778; padding: .5em 0; font-size: 12px; }
 </style></head><body>
 <header>
   <span class="prog" id="prog"></span>
   <label>class <select id="filter"><option value="">all</option></select></label>
-  <span id="pos"></span>
+  <span id="pos" style="color:#9ab"></span>
 </header>
-<div id="msg"></div>
-<div id="meta"></div>
 <main>
-  <div class="imgs">
-    <div class="cap">triage overlay (as graded by Haiku)</div>
-    <img id="overlay" alt="overlay">
-    <div class="pair">
-      <div>
-        <div class="cap">raw frame — drag to draw a re-prompt box, then <b>b</b></div>
-        <div id="framewrap"><img id="frame" alt="frame"><canvas id="boxcanvas"></canvas></div>
-      </div>
-      <div>
-        <div class="cap" id="fixcap">auto-fix preview (green = kept+filled, red = original)</div>
-        <img id="autofix" alt="autofix">
-      </div>
-    </div>
+  <div id="info"></div>
+  <div id="msg"></div>
+  <div class="tabs" id="tabs"></div>
+  <div id="cap"></div>
+  <div id="imgwrap"><img id="view" alt="panel"><canvas id="boxcanvas"></canvas></div>
+  <div id="drawhint">Drag on the image to draw a box around the correct subject, then
+    <b>Save box</b> (Enter). <b>Esc</b> cancels.</div>
+  <div class="actions">
+    <button class="accept" onclick="decide('accept')">Mask is fine<kbd>a</kbd></button>
+    <button class="fix" onclick="decide('autofix')">Accept auto-fix<kbd>f</kbd></button>
+    <button class="draw" id="drawbtn" onclick="toggleDraw()">Draw box&hellip;<kbd>b</kbd></button>
+    <button class="save" id="savebtn" onclick="decide('box')">Save box<kbd>Enter</kbd></button>
+    <button class="discard" onclick="decide('discard')">Discard<kbd>d</kbd></button>
+    <button onclick="decide('skip')">Skip<kbd>s</kbd></button>
+    <button class="nav" onclick="nav(-1)">&larr; Prev</button>
+    <button onclick="nav(1)">Next &rarr;</button>
   </div>
-  <p><label>notes <input id="notes" placeholder="optional"></label></p>
+  <p><label>notes <input id="notes" placeholder="optional note saved with the decision"></label></p>
+  <div class="legend">Green = this instance's SAM-3 mask &nbsp;&middot;&nbsp; yellow outline =
+    other instances in the frame &nbsp;&middot;&nbsp; tabs: <kbd>1</kbd>&ndash;<kbd>4</kbd>
+    &nbsp;&middot;&nbsp; <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> navigate</div>
 </main>
-<div class="keys">
-  <kbd>a</kbd> accept as-is &nbsp; <kbd>f</kbd> accept auto-fix &nbsp;
-  <kbd>b</kbd> save drawn box &nbsp; <kbd>d</kbd> discard &nbsp; <kbd>s</kbd> skip &nbsp;
-  <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> navigate &nbsp; <kbd>Esc</kbd> clear box
-</div>
 <script>
-let items = [], decisions = {}, order = [], pos = 0, box = null, drag = null;
-
+const TABS = [
+  {id: 'mask', label: 'Original mask', url: '/mask/',
+   cap: 'The mask exactly as SAM-3 produced it \\u2014 green fill = the instance under ' +
+        'review, yellow outline = other instances detected in this frame.'},
+  {id: 'autofix', label: 'Auto-fix preview', url: '/autofix/',
+   cap: 'Deterministic fix (keep largest component, fill holes) \\u2014 green = result, ' +
+        'red outline = original mask extent.'},
+  {id: 'zoom', label: 'Zoom', url: '/zoom/',
+   cap: 'Magnified crop around the mask, true pixels (same colours as the mask tab).'},
+  {id: 'raw', label: 'Raw frame', url: '/frame/',
+   cap: 'The exported frame with no overlay.'},
+];
+let items = [], decisions = {}, order = [], pos = 0, tab = 'mask';
+let drawMode = false, box = null, drag = null;
+const fixStats = {};
 const $ = id => document.getElementById(id);
 
 async function init() {
@@ -383,6 +499,11 @@ async function init() {
     $('filter').appendChild(o);
   }
   $('filter').onchange = () => { rebuild(); render(); };
+  for (const t of TABS) {
+    const b = document.createElement('button');
+    b.id = 'tab-' + t.id; b.textContent = t.label; b.onclick = () => setTab(t.id);
+    $('tabs').appendChild(b);
+  }
   rebuild();
   pos = order.findIndex(i => !decisions[items[i].key]);
   if (pos < 0) pos = 0;
@@ -395,27 +516,57 @@ function rebuild() {
   pos = Math.min(pos, Math.max(0, order.length - 1));
 }
 
+function setTab(t) {
+  tab = t;
+  if (t !== 'mask' && drawMode) setDraw(false);
+  render();
+}
+
+function setDraw(on) {
+  drawMode = on; box = null; drag = null;
+  if (on) tab = 'mask';  // boxes are drawn in full-frame coordinates
+  $('drawbtn').classList.toggle('on', on);
+  $('drawbtn').innerHTML = on ? 'Cancel<kbd>Esc</kbd>' : 'Draw box&hellip;<kbd>b</kbd>';
+  $('savebtn').style.display = on ? '' : 'none';
+  $('drawhint').style.display = on ? 'block' : 'none';
+  render();
+}
+
+function toggleDraw() { setDraw(!drawMode); }
+
 function render() {
   const nDone = order.filter(i => decisions[items[i].key]).length;
   $('prog').textContent = nDone + ' / ' + order.length + ' decided';
-  if (!order.length) { $('meta').textContent = 'queue empty for this filter'; return; }
-  const it = items[order[pos]];
+  if (!order.length) { $('info').textContent = 'queue empty for this filter'; return; }
+  const i = order[pos], it = items[i];
   $('pos').textContent = '#' + (pos + 1) + '  ' + it.key;
   const d = decisions[it.key];
-  $('meta').innerHTML = '<span class="verdict">' + it.verdict + '</span>' +
-    'conf ' + it.confidence + ' — ' + esc(it.rationale) +
-    (it.flags ? ' <span style="color:#667">[' + esc(it.flags) + ']</span>' : '') +
-    (d ? '<span class="done">decided: ' + d.action + '</span>' : '');
-  const i = order[pos];
-  $('overlay').src = '/overlay/' + i + '.png';
-  $('frame').src = '/frame/' + i + '.png';
-  $('autofix').src = '/autofix/' + i + '.png';
-  fetch('/api/autofix/' + i).then(r => r.json()).then(s => {
-    if (s.components_before !== undefined)
-      $('fixcap').textContent = 'auto-fix preview — ' + s.components_before +
-        ' component(s), area ' + s.area_before + ' \\u2192 ' + s.area_after;
-  }).catch(() => {});
-  box = null; drawBox();
+  $('info').innerHTML =
+    '<span class="verdict">' + esc(it.verdict) + '</span>' +
+    '<span class="conf">conf ' + esc(it.confidence) + '</span>' +
+    '<span class="rationale">' + esc(it.rationale) + '</span>' +
+    (it.flags ? '<span class="flags">[' + esc(it.flags) + ']</span>' : '') +
+    (d ? '<span class="done">decided: ' + esc(d.action) + '</span>' : '');
+  const t = TABS.find(t => t.id === tab);
+  for (const tb of TABS)
+    $('tab-' + tb.id).classList.toggle('active', tb.id === tab);
+  $('cap').textContent = t.cap;
+  if (tab === 'autofix') {
+    if (fixStats[i]) capStats(i);
+    else fetch('/api/autofix/' + i).then(r => r.json()).then(s => {
+      fixStats[i] = s; if (tab === 'autofix' && order[pos] === i) capStats(i);
+    }).catch(() => {});
+  }
+  $('view').src = t.url + i + '.png';
+  $('boxcanvas').style.display = (drawMode && tab === 'mask') ? 'block' : 'none';
+  drawBox();
+}
+
+function capStats(i) {
+  const s = fixStats[i];
+  if (s.components_before !== undefined)
+    $('cap').textContent = TABS[1].cap + '  (' + s.components_before +
+      ' component(s), area ' + s.area_before + ' \\u2192 ' + s.area_after + ')';
 }
 
 function esc(s) {
@@ -427,20 +578,28 @@ function flash(m) { $('msg').textContent = m; setTimeout(() => $('msg').textCont
 async function decide(action) {
   if (!order.length) return;
   const it = items[order[pos]];
-  if (action === 'box' && !box) { flash('draw a box on the frame first'); return; }
+  if (action === 'box' && !box) { flash('draw a box on the image first'); return; }
   const body = { key: it.key, action, notes: $('notes').value,
                  box: action === 'box' ? box : null };
   const r = await (await fetch('/api/decide', { method: 'POST',
     headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
   if (!r.ok) { flash(r.error); return; }
   decisions[it.key] = r.row; $('notes').value = '';
+  if (drawMode) setDraw(false);
   const nxt = order.findIndex((i, j) => j > pos && !decisions[items[i].key]);
   pos = nxt >= 0 ? nxt : Math.min(pos + 1, order.length - 1);
   render();
 }
 
-// box drawing: canvas overlays the frame img; store native-pixel coords
-const cv = $('boxcanvas'), img = $('frame');
+function nav(step) {
+  if (!order.length) return;
+  pos = Math.max(0, Math.min(pos + step, order.length - 1));
+  box = null;
+  if (drawMode) setDraw(false); else render();
+}
+
+// box drawing: canvas overlays the panel img; coords stored in native frame pixels
+const cv = $('boxcanvas'), img = $('view');
 function syncCanvas() {
   cv.width = img.clientWidth; cv.height = img.clientHeight;
   cv.style.width = img.clientWidth + 'px'; cv.style.height = img.clientHeight + 'px';
@@ -473,12 +632,17 @@ document.addEventListener('keydown', e => {
   const k = e.key;
   if (k === 'a') decide('accept');
   else if (k === 'f') decide('autofix');
-  else if (k === 'b') decide('box');
+  else if (k === 'b') toggleDraw();
+  else if (k === 'Enter' && drawMode) decide('box');
   else if (k === 'd') decide('discard');
   else if (k === 's') decide('skip');
-  else if (k === 'ArrowRight') { pos = Math.min(pos + 1, order.length - 1); render(); }
-  else if (k === 'ArrowLeft') { pos = Math.max(pos - 1, 0); render(); }
-  else if (k === 'Escape') { box = null; drawBox(); }
+  else if (k === '1') setTab('mask');
+  else if (k === '2') setTab('autofix');
+  else if (k === '3') setTab('zoom');
+  else if (k === '4') setTab('raw');
+  else if (k === 'ArrowRight') nav(1);
+  else if (k === 'ArrowLeft') nav(-1);
+  else if (k === 'Escape') { if (drawMode) setDraw(false); else { box = null; drawBox(); } }
 });
 init();
 </script></body></html>

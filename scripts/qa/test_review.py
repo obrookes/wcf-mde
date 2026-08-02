@@ -25,6 +25,9 @@ from scripts.qa.review_server import (
     key_of,
     load_decisions,
     render_autofix_panel,
+    render_mask_panel,
+    render_zoom_panel,
+    zoom_bbox,
 )
 
 H, W = 120, 160
@@ -206,6 +209,44 @@ def test_render_autofix_panel_shape_and_effect():
     assert not (out == frame).all()
 
 
+def test_render_mask_panel_target_and_siblings():
+    frame = np.full((H, W, 3), 120, np.uint8)
+    target = np.zeros((H, W), bool)
+    target[10:40, 10:40] = True
+    sib = np.zeros((H, W), bool)
+    sib[70:100, 70:100] = True
+    out = render_mask_panel(frame, target, [sib])
+    assert out.shape == frame.shape and out.dtype == np.uint8
+    assert not (out[20, 20] == frame[20, 20]).all(), "target fill should tint pixels"
+    assert not (out[70, 85] == frame[70, 85]).all(), "sibling contour should be drawn"
+    assert (out[60, 60] == frame[60, 60]).all(), "background untouched"
+    # no siblings is fine too
+    out2 = render_mask_panel(frame, target)
+    assert (out2[70, 85] == frame[70, 85]).all()
+
+
+def test_zoom_bbox():
+    m = np.zeros((H, W), bool)
+    m[50:70, 60:100] = True  # bbox 40 wide, 20 tall -> half = max(40*1.4/2, 60) = 60
+    x0, y0, x1, y1 = zoom_bbox(m)
+    assert (x0, x1) == (19, 139)  # cx=79, half=min_half=60
+    assert (y0, y1) == (0, 119)   # cy=59: clamped at the top, 1 short of H at the bottom
+    assert zoom_bbox(np.zeros((H, W), bool)) == (0, 0, W, H)
+
+
+def test_render_zoom_panel_upscales():
+    frame = np.full((H, W, 3), 120, np.uint8)
+    m = np.zeros((H, W), bool)
+    m[50:70, 60:100] = True
+    out = render_zoom_panel(render_mask_panel(frame, m), m, out_width=720, max_scale=4)
+    x0, y0, x1, y1 = zoom_bbox(m)
+    assert out.shape[1] > (x1 - x0), "crop should be upscaled"
+    assert out.shape[1] % (x1 - x0) == 0, "integer nearest-neighbour scale"
+    # empty mask degrades to the full frame, unscaled beyond caps
+    out2 = render_zoom_panel(frame, np.zeros((H, W), bool))
+    assert out2.shape[1] % W == 0
+
+
 # --------------------------------------------------------------------------------------
 # apply_corrections morph end-to-end
 # --------------------------------------------------------------------------------------
@@ -279,10 +320,10 @@ def test_frame_filename():
 
 
 def _seed_bundle_inputs(td: Path, videos_frames):
-    """Write a frame PNG, mask JSON, and overlay PNG for each (video, frame)."""
+    """Write a frame PNG and mask JSON for each (video, frame)."""
     import cv2
-    frames_dir, masks_dir, overlays_dir = td / "frames", td / "masks", td / "overlays"
-    for d in (frames_dir, masks_dir, overlays_dir):
+    frames_dir, masks_dir = td / "frames", td / "masks"
+    for d in (frames_dir, masks_dir):
         d.mkdir()
     m = np.zeros((H, W), bool)
     m[10:30, 10:30] = True
@@ -291,35 +332,28 @@ def _seed_bundle_inputs(td: Path, videos_frames):
         cv2.imwrite(str(frames_dir / frame_filename(video, frame)), img)
         save_instance_masks(masks_dir, video, frame,
                             [{"mask": m, "center_xy": (20, 20), "area_px": int(m.sum())}])
-        cv2.imwrite(str(overlays_dir / f"{video}_frame{frame:06d}_inst0.png"), img)
-    return frames_dir, masks_dir, overlays_dir
+    return frames_dir, masks_dir
 
 
 def test_stage_bundle_end_to_end():
     with tempfile.TemporaryDirectory() as t:
         td = Path(t)
-        frames_dir, masks_dir, overlays_dir = _seed_bundle_inputs(
-            td, [("vidA", 1), ("vidB", 2)])
+        frames_dir, masks_dir = _seed_bundle_inputs(td, [("vidA", 1), ("vidB", 2)])
         rows = [
-            _row(video="vidA", frame=1, verdict="split",
-                 overlay_path=str(overlays_dir / "vidA_frame000001_inst0.png")),
-            _row(video="vidB", frame=2, verdict="bleed",
-                 overlay_path=str(overlays_dir / "vidB_frame000002_inst0.png")),
+            _row(video="vidA", frame=1, verdict="split", overlay_path="/gone/a.png"),
+            _row(video="vidB", frame=2, verdict="bleed", overlay_path="/gone/b.png"),
             _row(video="vidB", frame=2, verdict="ok",  # not in queue: nothing copied for it
-                 overlay_path=str(overlays_dir / "nonexistent.png")),
+                 overlay_path="/gone/c.png"),
         ]
         stage = td / "stage"
         stats = stage_bundle(rows, frames_dir, masks_dir, stage)
-        assert stats["missing"] == []
-        assert stats == {"queue": 2, "frames": 2, "masks": 2, "overlays": 2, "missing": []}
+        assert stats == {"queue": 2, "frames": 2, "masks": 2, "missing": []}
 
-        # bundled CSV: only bad rows, overlay paths rewritten bundle-relative
+        # bundled CSV: only bad rows; stale overlay paths blanked (UI renders from mask JSON)
         with open(stage / "verdicts.csv", newline="") as f:
             got = list(csv.DictReader(f))
         assert [r["verdict"] for r in got] == ["bleed", "split"]  # class-sorted queue order
-        assert all(r["overlay_path"].startswith("overlays/") for r in got)
-        for r in got:
-            assert (stage / r["overlay_path"]).exists()
+        assert all(r["overlay_path"] == "" for r in got)
 
         # data + code + launcher all present
         assert (stage / "frames" / frame_filename("vidA", 1)).exists()
@@ -332,10 +366,9 @@ def test_stage_bundle_end_to_end():
 def test_stage_bundle_reports_missing():
     with tempfile.TemporaryDirectory() as t:
         td = Path(t)
-        frames_dir, masks_dir, overlays_dir = _seed_bundle_inputs(td, [("vidA", 1)])
+        frames_dir, masks_dir = _seed_bundle_inputs(td, [("vidA", 1)])
         (frames_dir / frame_filename("vidA", 1)).unlink()
-        rows = [_row(video="vidA", frame=1, verdict="split",
-                     overlay_path=str(overlays_dir / "vidA_frame000001_inst0.png"))]
+        rows = [_row(video="vidA", frame=1, verdict="split", overlay_path="/gone/a.png")]
         stats = stage_bundle(rows, frames_dir, masks_dir, td / "stage")
         assert stats["frames"] == 0 and stats["masks"] == 1
         assert [k for k, _ in stats["missing"]] == ["frame"]
