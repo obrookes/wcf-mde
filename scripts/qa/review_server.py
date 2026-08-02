@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 """Minimalist human review UI for the Haiku-flagged bad masks — a single-file stdlib HTTP
-server meant to run on the login node and be browsed through an SSH tunnel:
+server. The intended way to run it is LOCALLY, from a self-contained bundle built by
+make_review_bundle.py (download the tarball, `python run_review.py`, browse localhost:8765 —
+see the bundle's README.txt). It can also run on the login node through an SSH tunnel:
 
     python scripts/qa/review_server.py \
         --verdicts  .../qa_pilot/verdicts_haiku.csv \
         --frames-dir .../export_test/frames \
         --masks-dir  .../export_test/masks \
         --out       .../qa_pilot/corrections.csv
-    # locally:  ssh -L 8765:localhost:8765 <login-node>  ->  http://localhost:8765
+    # laptop:  ssh -L 8765:localhost:8765 <login-node>  ->  http://localhost:8765
 
 The queue is every verdict row with `result_type=succeeded` and `verdict != ok`, grouped by
 failure class. For each mask the page shows the pilot overlay panel, the raw exported frame
@@ -58,6 +60,11 @@ CORRECTION_FIELDS = [
 
 def key_of(row: dict) -> str:
     return f"{row['video_name']}|{row['frame_idx']}|{row['instance_idx']}"
+
+
+def frame_filename(video_name: str, frame_idx: int | str) -> str:
+    """Exported-frame naming convention shared with export_calibrated_frames.py."""
+    return f"{video_name}_frame{int(frame_idx):06d}.png"
 
 
 def build_queue(rows: list[dict], only_classes: list[str] | None = None) -> list[dict]:
@@ -161,7 +168,7 @@ class ReviewApp:
         self.lock = threading.Lock()
 
     def frame_path(self, item: dict) -> Path:
-        return self.frames_dir / f"{item['video_name']}_frame{int(item['frame_idx']):06d}.png"
+        return self.frames_dir / frame_filename(item["video_name"], item["frame_idx"])
 
     def instance_mask(self, item: dict) -> np.ndarray:
         instances = load_instance_masks(self.masks_dir, item["video_name"],

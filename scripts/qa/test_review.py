@@ -14,12 +14,14 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.masks import load_instance_masks, save_instance_masks
 from scripts.qa.apply_corrections import APPLIED_FIELDS, apply_morph, write_applied
+from scripts.qa.make_review_bundle import stage_bundle
 from scripts.qa.review_server import (
     CORRECTION_FIELDS,
     append_decision,
     autofix_mask,
     build_queue,
     clamp_box,
+    frame_filename,
     key_of,
     load_decisions,
     render_autofix_panel,
@@ -264,6 +266,79 @@ def test_apply_morph_end_to_end():
         # originals untouched
         orig = load_instance_masks(masks_dir, "vid", 5)
         assert (orig[1]["mask"] == broken).all()
+
+
+def test_frame_filename():
+    assert frame_filename("vid", 7) == "vid_frame000007.png"
+    assert frame_filename("vid", "42") == "vid_frame000042.png"
+
+
+# --------------------------------------------------------------------------------------
+# make_review_bundle
+# --------------------------------------------------------------------------------------
+
+
+def _seed_bundle_inputs(td: Path, videos_frames):
+    """Write a frame PNG, mask JSON, and overlay PNG for each (video, frame)."""
+    import cv2
+    frames_dir, masks_dir, overlays_dir = td / "frames", td / "masks", td / "overlays"
+    for d in (frames_dir, masks_dir, overlays_dir):
+        d.mkdir()
+    m = np.zeros((H, W), bool)
+    m[10:30, 10:30] = True
+    img = np.full((H, W, 3), 90, np.uint8)
+    for video, frame in videos_frames:
+        cv2.imwrite(str(frames_dir / frame_filename(video, frame)), img)
+        save_instance_masks(masks_dir, video, frame,
+                            [{"mask": m, "center_xy": (20, 20), "area_px": int(m.sum())}])
+        cv2.imwrite(str(overlays_dir / f"{video}_frame{frame:06d}_inst0.png"), img)
+    return frames_dir, masks_dir, overlays_dir
+
+
+def test_stage_bundle_end_to_end():
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        frames_dir, masks_dir, overlays_dir = _seed_bundle_inputs(
+            td, [("vidA", 1), ("vidB", 2)])
+        rows = [
+            _row(video="vidA", frame=1, verdict="split",
+                 overlay_path=str(overlays_dir / "vidA_frame000001_inst0.png")),
+            _row(video="vidB", frame=2, verdict="bleed",
+                 overlay_path=str(overlays_dir / "vidB_frame000002_inst0.png")),
+            _row(video="vidB", frame=2, verdict="ok",  # not in queue: nothing copied for it
+                 overlay_path=str(overlays_dir / "nonexistent.png")),
+        ]
+        stage = td / "stage"
+        stats = stage_bundle(rows, frames_dir, masks_dir, stage)
+        assert stats["missing"] == []
+        assert stats == {"queue": 2, "frames": 2, "masks": 2, "overlays": 2, "missing": []}
+
+        # bundled CSV: only bad rows, overlay paths rewritten bundle-relative
+        with open(stage / "verdicts.csv", newline="") as f:
+            got = list(csv.DictReader(f))
+        assert [r["verdict"] for r in got] == ["bleed", "split"]  # class-sorted queue order
+        assert all(r["overlay_path"].startswith("overlays/") for r in got)
+        for r in got:
+            assert (stage / r["overlay_path"]).exists()
+
+        # data + code + launcher all present
+        assert (stage / "frames" / frame_filename("vidA", 1)).exists()
+        assert load_instance_masks(stage / "masks", "vidB", 2)[0]["mask"].sum() == 400
+        for rel in ("scripts/qa/review_server.py", "scripts/masks.py", "run_review.py",
+                    "requirements.txt", "README.txt"):
+            assert (stage / rel).exists(), rel
+
+
+def test_stage_bundle_reports_missing():
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        frames_dir, masks_dir, overlays_dir = _seed_bundle_inputs(td, [("vidA", 1)])
+        (frames_dir / frame_filename("vidA", 1)).unlink()
+        rows = [_row(video="vidA", frame=1, verdict="split",
+                     overlay_path=str(overlays_dir / "vidA_frame000001_inst0.png"))]
+        stats = stage_bundle(rows, frames_dir, masks_dir, td / "stage")
+        assert stats["frames"] == 0 and stats["masks"] == 1
+        assert [k for k, _ in stats["missing"]] == ["frame"]
 
 
 def test_write_applied_schema():
