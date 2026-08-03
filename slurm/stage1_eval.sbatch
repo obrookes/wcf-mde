@@ -36,8 +36,8 @@ mkdir -p "$(dirname "$QA_RESULTS")" "$QA_MASKS" "$QA_DEPTH"
 srun python scripts/run_calibration_eval.py \
     --device cuda \
     --annotations-csv "$QA_SAMPLE" \
-    --output-csv "$QA_RESULTS" \
-    --save-mask-dir "$QA_MASKS" \
+    --results-csv "$QA_RESULTS" \
+    --save-masks-dir "$QA_MASKS" \
     --save-depth-dir "$QA_DEPTH" \
     --sam3-checkpoint "$SAM3_CHECKPOINT" \
     --depth-model "$DEPTH_MODEL"

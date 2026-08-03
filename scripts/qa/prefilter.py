@@ -3,7 +3,7 @@
 
 Every mask that reaches a vision model costs money, so the leverage in the whole funnel is in
 how much can be decided without one. This stage reads the persisted COCO-RLE masks
-(`run_calibration_eval.py --save-mask-dir`) plus the results CSV, computes cheap geometric
+(`run_calibration_eval.py --save-masks-dir`) plus the results CSV, computes cheap geometric
 statistics, and sorts each detected instance into:
 
   * **pass**   -- a clear singleton with nothing anomalous about it
@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--results-csv", type=Path, default=REPO_ROOT / "outputs" / "qa" / "results.csv",
                    help="run_calibration_eval.py output for the sampled frames")
     p.add_argument("--mask-dir", type=Path, default=REPO_ROOT / "outputs" / "qa" / "masks",
-                   help="run_calibration_eval.py --save-mask-dir")
+                   help="run_calibration_eval.py --save-masks-dir")
     p.add_argument("--sample-csv", type=Path, default=REPO_ROOT / "outputs" / "qa" / "sample.csv",
                    help="scripts/qa/sample.py output, for stratum and inclusion_weight")
     p.add_argument("--out", type=Path, default=REPO_ROOT / "outputs" / "qa" / "prefilter.csv")

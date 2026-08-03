@@ -51,7 +51,8 @@ PI3_PIXEL_LIMIT = 255_000  # matches Pi3's load_images_as_tensor default
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--annotations-csv", type=Path, default=REPO_ROOT / "data" / "annotations_06052026.csv")
-    p.add_argument("--video-list-xlsx", type=Path, default=REPO_ROOT / "data" / "list_reference_videos.xlsx")
+    p.add_argument("--video-list", "--video-list-xlsx", type=Path, dest="video_list_xlsx",
+                   default=REPO_ROOT / "data" / "list_reference_videos.xlsx")
     p.add_argument("--data-dir", type=Path, default=REPO_ROOT / "data")
     p.add_argument("--sam3-checkpoint", type=Path, default=DEFAULT_SAM3_CHECKPOINT)
     p.add_argument("--sam3-prompt", type=str, default="person holding sign")
@@ -59,7 +60,8 @@ def parse_args() -> argparse.Namespace:
                    help="metric depth backend: Pi3X or Depth Anything 3 (DA3NESTED, metres-native)")
     p.add_argument("--pi3-model-id", type=str, default="yyfz233/Pi3X")
     p.add_argument("--da3-model-id", type=str, default="depth-anything/DA3NESTED-GIANT-LARGE-1.1")
-    p.add_argument("--output-csv", type=Path, default=REPO_ROOT / "outputs" / "calibration_results.csv")
+    p.add_argument("--results-csv", "--output-csv", type=Path, dest="output_csv",
+                   default=REPO_ROOT / "outputs" / "calibration_results.csv")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--conf", type=float, default=0.25)
     p.add_argument("--limit", type=int, default=None, help="process at most this many CSV rows (for smoke-testing)")
@@ -79,12 +81,14 @@ def parse_args() -> argparse.Namespace:
              "per-video calibration without re-running depth inference. Safe on full runs.",
     )
     p.add_argument(
+        "--save-masks-dir",
         "--save-mask-dir",
         type=Path,
+        dest="save_mask_dir",
         default=None,
         help="persist each frame's detected-instance SAM-3 masks as COCO RLE JSON here "
              "(keyed by video_name + frame_idx; one entry per instance, ordered to match "
-             "instance_idx in --output-csv), for Stage-1 alignment (scripts/alignment.py) "
+             "instance_idx in --results-csv), for Stage-1 alignment (scripts/alignment.py) "
              "to reload without re-running SAM-3. Safe on full runs.",
     )
     args = p.parse_args()

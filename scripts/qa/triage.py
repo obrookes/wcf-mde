@@ -139,7 +139,9 @@ def parse_args() -> argparse.Namespace:
     sp_fetch = sub.add_parser("fetch", help="stream results into a verdicts CSV")
     common(sp_fetch)
     sp_fetch.add_argument("--out", type=Path, default=None,
-                          help="default: outputs/qa/verdicts_<name>.csv")
+                          help="default: outputs/qa/verdicts.csv (backend-neutral -- both this "
+                               "VLM backend and scripts/qa/heuristic_verdicts.py write the same "
+                               "verdicts-CSV contract)")
 
     return p.parse_args()
 
@@ -492,7 +494,7 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     record = load_record(record_path(args.batch_dir, args.name))
     client = require_client()
     mapping = record["custom_ids"]
-    out = args.out or (REPO_ROOT / "outputs" / "qa" / f"verdicts_{args.name}.csv")
+    out = args.out or (REPO_ROOT / "outputs" / "qa" / "verdicts.csv")
 
     rows: list[dict] = []
     seen: set[str] = set()

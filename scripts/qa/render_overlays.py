@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
                    default=REPO_ROOT / "outputs" / "qa" / "overlay_manifest.csv",
                    help="overlay path -> (video_name, frame_idx, instance_idx); Stage 3's "
                         "custom_id map is built from this")
-    p.add_argument("--video-list-xlsx", type=Path,
+    p.add_argument("--video-list", "--video-list-xlsx", type=Path, dest="video_list_xlsx",
                    default=REPO_ROOT / "data" / "list_reference_videos.xlsx")
     p.add_argument("--data-dir", type=Path, default=REPO_ROOT / "data")
     p.add_argument("--frames-dir", type=Path, default=None,

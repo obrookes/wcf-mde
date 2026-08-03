@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     sp_gold.add_argument("--prefilter-csv", type=Path,
                          default=REPO_ROOT / "outputs" / "qa" / "prefilter.csv")
     sp_gold.add_argument("--verdicts", type=Path,
-                         default=REPO_ROOT / "outputs" / "qa" / "verdicts_haiku.csv")
+                         default=REPO_ROOT / "outputs" / "qa" / "verdicts.csv")
     sp_gold.add_argument("--manifest", type=Path,
                          default=REPO_ROOT / "outputs" / "qa" / "overlay_manifest.csv")
     sp_gold.add_argument("--per-class", type=int, default=30,
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     sp_sum.add_argument("--prefilter-csv", type=Path,
                         default=REPO_ROOT / "outputs" / "qa" / "prefilter.csv")
     sp_sum.add_argument("--verdicts", type=Path,
-                        default=REPO_ROOT / "outputs" / "qa" / "verdicts_haiku.csv")
+                        default=REPO_ROOT / "outputs" / "qa" / "verdicts.csv")
     sp_sum.add_argument("--escalated-verdicts", type=Path, default=None,
                         help="outputs/qa/verdicts_opus.csv, if the escalation pass has run")
     sp_sum.add_argument("--gold", type=Path, default=None,

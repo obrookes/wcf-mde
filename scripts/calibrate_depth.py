@@ -91,8 +91,8 @@ def parse_args() -> argparse.Namespace:
                    help="how Stage-1 picks its alignment anchor within each group: 'furthest' "
                         "(matches timmh/Markham-25) or 'median' (gentler for this dataset's "
                         "smaller per-camera point counts). Only used when --align != none")
-    p.add_argument("--mask-dir", type=Path, default=None,
-                   help="dir of *_masks.json from run_calibration_eval.py --save-mask-dir; "
+    p.add_argument("--masks-dir", "--mask-dir", type=Path, dest="mask_dir", default=None,
+                   help="dir of *_masks.json from run_calibration_eval.py --save-masks-dir; "
                         "required when --align != none (Stage-1 needs per-instance masks to "
                         "isolate background pixels)")
     p.add_argument("--align-min-points", type=int, default=4,
@@ -115,8 +115,8 @@ def parse_args() -> argparse.Namespace:
                         "silently under-excludes -- see scripts/qc_exclusions.py")
     args = p.parse_args()
     if args.align != "none" and args.mask_dir is None:
-        p.error("--align requires --mask-dir (per-instance masks saved by "
-                "run_calibration_eval.py --save-mask-dir)")
+        p.error("--align requires --masks-dir (per-instance masks saved by "
+                "run_calibration_eval.py --save-masks-dir)")
     return args
 
 

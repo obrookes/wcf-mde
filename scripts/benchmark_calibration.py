@@ -15,7 +15,7 @@ There is deliberately no --out-dir/--viz/--depth-dir-as-output-flag here: this s
 to write a *_calib.npy, by construction, so it's safe to sweep broadly before committing to a
 --method for the real (npy-producing) calibrate_depth.py run.
 
---depth-dir/--mask-dir are read-only inputs here (source of *_orig.npy / *_masks.json), needed
+--depth-dir/--masks-dir are read-only inputs here (source of *_orig.npy / *_masks.json), needed
 only when --aligns includes "ransac" (Stage-1 alignment re-reads them per group).
 """
 from __future__ import annotations
@@ -64,8 +64,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--depth-dir", type=Path, default=None,
                    help="read-only dir of *_orig.npy from run_calibration_eval.py --save-depth-dir; "
                         "only needed when --aligns includes ransac (never written to)")
-    p.add_argument("--mask-dir", type=Path, default=None,
-                   help="read-only dir of *_masks.json from run_calibration_eval.py --save-mask-dir; "
+    p.add_argument("--masks-dir", "--mask-dir", type=Path, dest="mask_dir", default=None,
+                   help="read-only dir of *_masks.json from run_calibration_eval.py --save-masks-dir; "
                         "required when --aligns includes ransac")
     p.add_argument("--align-min-points", type=int, default=4,
                    help="skip Stage-1 alignment for a group with fewer than this many points "
@@ -77,19 +77,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--anchors", nargs="+", choices=["mask_mean", "centroid"],
                    default=["mask_mean", "centroid"], help="subject-depth anchors to sweep")
     p.add_argument("--aligns", nargs="+", choices=["none", "ransac"], default=["none"],
-                   help="Stage-1 alignment options to sweep; 'ransac' requires --depth-dir/--mask-dir")
+                   help="Stage-1 alignment options to sweep; 'ransac' requires --depth-dir/--masks-dir")
     p.add_argument("--ref-frame-methods", nargs="+", choices=list(REFERENCE_METHODS), default=["furthest"],
                    help="Stage-1 reference-frame picks to sweep; only used when --aligns includes ransac")
     p.add_argument("--limit-videos", type=int, default=None,
                    help="only consider the first N videos/cameras (start small)")
-    p.add_argument("--out-csv", type=Path, default=REPO_ROOT / "outputs" / "calibration_benchmark.csv",
+    p.add_argument("--out", "--out-csv", type=Path, dest="out_csv",
+                   default=REPO_ROOT / "outputs" / "calibration_benchmark.csv",
                    help="per-combination metrics CSV (metrics only -- no depth data)")
     p.add_argument("--sort-by", choices=["improvement", "mae_cal"], default="improvement",
                    help="ranking key for the printed top-N table")
     p.add_argument("--top-n", type=int, default=15, help="how many ranked rows to print to console")
     args = p.parse_args()
     if "ransac" in args.aligns and (args.depth_dir is None or args.mask_dir is None):
-        p.error("--aligns ransac requires --depth-dir and --mask-dir (per-instance masks and "
+        p.error("--aligns ransac requires --depth-dir and --masks-dir (per-instance masks and "
                 "original depth maps saved by run_calibration_eval.py)")
     return args
 

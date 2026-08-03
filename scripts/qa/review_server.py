@@ -677,7 +677,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--frames-dir", type=Path, required=True,
                    help="exported frame PNGs (<video_name>_frame%%06d.png)")
     p.add_argument("--masks-dir", type=Path, required=True,
-                   help="mask JSONs as written by run_calibration_eval.py --save-mask-dir")
+                   help="mask JSONs as written by run_calibration_eval.py --save-masks-dir")
     p.add_argument("--out", type=Path, default=None,
                    help="corrections CSV to append decisions to "
                         "(default: corrections.csv next to --verdicts)")

@@ -6,6 +6,9 @@ Consumes the *_calib.npy maps written by calibrate_depth.py --out-dir and produc
   <out-dir>/depth_maps/{video_name}_frame{idx:06d}_calib.npy   (copied as-is, fp16)
   <out-dir>/frames/{video_name}_frame{idx:06d}.png             (decoded from the source video)
 
+With --masks-dir, also copies each exported frame's mask (if any) into <out-dir>/masks/,
+completing the frames/ + masks/ layout scripts/score_masks.py expects.
+
 Only QC-valid frames are exported: any (video_name, frame_idx) present in the
 scripts/qc_annotations.py flags CSV is dropped. calibrate_depth.py's --qc-flags is optional,
 so a calib dir may well contain maps for flagged frames -- the filter is applied here
@@ -30,6 +33,7 @@ import cv2
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.calibrate_depth import build_exclusions
 from scripts.frame_source import iter_frames_at_indices
+from scripts.masks import mask_path
 from scripts.video_lookup import load_anno_to_path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -39,7 +43,7 @@ CALIB_NAME_RE = re.compile(r"^(?P<video_name>.+)_frame(?P<frame_idx>\d{6})_calib
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--calib-dir", type=Path, default=REPO_ROOT / "outputs" / "depth_calib_test",
+    p.add_argument("--calib-dir", type=Path, default=REPO_ROOT / "outputs" / "depth_calib",
                    help="dir of *_calib.npy maps from calibrate_depth.py --out-dir")
     p.add_argument("--qc-flags", type=Path,
                    default=REPO_ROOT / "data" / "qc_flags_annotations_20260709_with_fps.csv",
@@ -58,7 +62,30 @@ def parse_args() -> argparse.Namespace:
                    help="root the video-list `ori` paths are relative to")
     p.add_argument("--frame-format", choices=["png", "jpg"], default="png",
                    help="image format for exported frames (png is lossless)")
+    p.add_argument("--masks-dir", type=Path, default=None,
+                   help="dir of *_masks.json from run_calibration_eval.py --save-masks-dir; if "
+                        "given, each successfully exported frame's mask (if any) is also copied "
+                        "into <out-dir>/masks/, completing the frames/ + masks/ layout "
+                        "scripts/score_masks.py expects. Omit to skip mask export entirely "
+                        "(no masks/ dir is created)")
     return p.parse_args()
+
+
+def copy_mask_for_frame(masks_dir: Path, out_masks_dir: Path, video_name: str, frame_idx: int) -> bool:
+    """If `<masks_dir>/{video_name}_frame{idx:06d}_masks.json` exists, copy it (shutil.copy2,
+    preserving mtime) into `out_masks_dir` and return True; otherwise return False without
+    touching the filesystem -- a frame with no detected instance has no mask JSON at all
+    (see run_calibration_eval.py), which is a valid, expected state, not an error.
+
+    `out_masks_dir` is created lazily (only on an actual copy), so passing `--masks-dir` on a
+    run where nothing gets exported never leaves behind an empty masks/ dir.
+    """
+    src = mask_path(masks_dir, video_name, frame_idx)
+    if not src.exists():
+        return False
+    out_masks_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, out_masks_dir / src.name)
+    return True
 
 
 def main() -> None:
@@ -94,8 +121,12 @@ def main() -> None:
 
     anno_to_path = load_anno_to_path(args.video_list, args.data_dir)
 
+    masks_out_dir = args.out_dir / "masks"
+
     n_exported = 0
     n_decode_failed = 0
+    n_masks_copied = 0
+    n_masks_absent = 0
     unresolved: list[str] = []
     for video_name in sorted(by_video):
         frames = by_video[video_name]
@@ -117,6 +148,11 @@ def main() -> None:
                 continue
             shutil.copy2(frames[frame_idx], depth_dir / frames[frame_idx].name)
             n_exported += 1
+            if args.masks_dir is not None:
+                if copy_mask_for_frame(args.masks_dir, masks_out_dir, video_name, frame_idx):
+                    n_masks_copied += 1
+                else:
+                    n_masks_absent += 1
 
     print(f"\nexported {n_exported} frame/depth-map pairs to {args.out_dir}")
     if unresolved:
@@ -125,6 +161,8 @@ def main() -> None:
               f"{', '.join(unresolved)}")
     if n_decode_failed:
         print(f"skipped {n_decode_failed} frames that failed to decode/write")
+    if args.masks_dir is not None:
+        print(f"copied {n_masks_copied} masks to {masks_out_dir} ({n_masks_absent} frames had no mask)")
 
 
 if __name__ == "__main__":

@@ -75,7 +75,7 @@ The depth backend is selected with `--depth-model {pi3x,da3}` (default `pi3x`):
 ```bash
 python scripts/run_calibration_eval.py \
   --device cuda \
-  --output-csv outputs/calibration_results.csv
+  --results-csv outputs/calibration_results.csv
 ```
 
 Useful flags (all have sensible defaults pointing at `data/`):
@@ -90,7 +90,7 @@ Useful flags (all have sensible defaults pointing at `data/`):
 | `--pi3-model-id ID` | Pi3X model id/path (default `yyfz233/Pi3X`) |
 | `--da3-model-id ID` | Depth Anything 3 model id/path (default `depth-anything/DA3NESTED-GIANT-LARGE-1.1`) |
 | `--conf FLOAT` | SAM-3 confidence threshold (default `0.25`) |
-| `--output-csv PATH` | where to write per-row results |
+| `--results-csv PATH` | where to write per-row results |
 | `--overlay-dir PATH` | dump frame\|mask\|depth sanity-check PNGs (requires `--limit`) |
 
 Run `python scripts/run_calibration_eval.py --help` for the full list.
@@ -102,7 +102,7 @@ dumping a PNG per frame is only meant for spot-checks, not full runs):
 
 ```bash
 python scripts/run_calibration_eval.py --device cuda --limit 20 \
-  --output-csv outputs/smoke_results.csv --overlay-dir outputs/overlays
+  --results-csv outputs/smoke_results.csv --overlay-dir outputs/overlays
 ```
 
 Each PNG is named `<video_stem>_frame<NNNNNN>.png` and shows the decoded
@@ -166,14 +166,14 @@ QC'd/fps-corrected generation — prefer the latter, and feed the resulting
 
 ```bash
 python scripts/run_calibration_eval.py --device cuda --limit 40 \
-  --output-csv outputs/smoke_results.csv \
-  --save-depth-dir outputs/depth_orig --save-mask-dir outputs/masks
+  --results-csv outputs/smoke_results.csv \
+  --save-depth-dir outputs/depth_orig --save-masks-dir outputs/masks
 ```
 
 `--save-depth-dir` writes one fp16 `.npy` per *decoded* frame
 (`<video_name>_frame<NNNNNN>_orig.npy`, keyed by the flat annotation name so it
 never collides across camera folders) — unconditionally, even if SAM-3 finds no
-detection in that frame. `--save-mask-dir` writes one `*_masks.json` per frame
+detection in that frame. `--save-masks-dir` writes one `*_masks.json` per frame
 *only when SAM-3 detects the prompt* (`status=empty_mask` frames get no mask);
 required for `--align ransac` below. Because of this, don't expect the two
 output dirs to have matching file counts — that's expected, not a bug. The
@@ -194,15 +194,15 @@ before committing to a `--method` for Step 2:
 python scripts/benchmark_calibration.py \
   --results-csv outputs/smoke_results.csv \
   --qc-flags data/qc_flags_annotations_20260709_with_fps.csv \
-  --depth-dir outputs/depth_orig --mask-dir outputs/masks \
-  --aligns none ransac --out-csv outputs/calibration_benchmark.csv
+  --depth-dir outputs/depth_orig --masks-dir outputs/masks \
+  --aligns none ransac --out outputs/calibration_benchmark.csv
 ```
 
-Writes one row per combination to `--out-csv` (mean LOO MAE uncalibrated vs.
+Writes one row per combination to `--out` (mean LOO MAE uncalibrated vs.
 calibrated, mean improvement, % of groups improved, and the same
 close/medium/long distance-bucket breakdown as Step 2) and prints a ranked
 top-N table (`--sort-by improvement|mae_cal`) to the console. `--depth-dir`/
-`--mask-dir` here are read-only inputs (only needed when `--aligns` includes
+`--masks-dir` here are read-only inputs (only needed when `--aligns` includes
 `ransac`, to re-derive Stage-1 alignment per group) — never written to.
 
 **Step 2 — fit calibration and write calibrated maps** (CPU only, no torch):
@@ -232,7 +232,7 @@ all points) so accuracy at different ranges is visible, not just one number.
 | `--calib-level {clip,cam}` | fit one calibrator per clip (default, e.g. one `DSCF0005.AVI`) or pool all clips under one camera-reference folder into a single fit (`cam`; needs `--video-list-xlsx`/`--data-dir`, both default to `data/`) |
 | `--qc-flags PATH` | exclude `(video_name, frame_idx)` rows flagged by Step 0's `qc_annotations.py` before fitting/reporting |
 | `--annotations-csv PATH` | the annotations generation Stage 1 was run against, used to resolve `--qc-flags` into that file's `frame_idx` space (see the join note in Step 0). Defaults to `data/annotations_20260709_with_fps_clean.csv` |
-| `--align {none,ransac}` | optional cross-frame background alignment (`scripts/alignment.py`) before calibration; default `none` since it isn't known ahead of time whether this helps on top of this dataset's already-joint depth inference — compare `calibration_fits.csv`'s `align_*` columns across runs to find out. Needs `--mask-dir` |
+| `--align {none,ransac}` | optional cross-frame background alignment (`scripts/alignment.py`) before calibration; default `none` since it isn't known ahead of time whether this helps on top of this dataset's already-joint depth inference — compare `calibration_fits.csv`'s `align_*` columns across runs to find out. Needs `--masks-dir` |
 | `--robust` | median-ratio / Theil-Sen fit for `scale`/`linear` instead of least-squares |
 
 `--method` selects the calibration model (`scripts/calibration.py`):

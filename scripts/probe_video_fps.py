@@ -66,14 +66,18 @@ def probe(path: Path) -> dict:
     }
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--data-root", type=Path,
+    ap.add_argument("--data-dir", "--data-root", type=Path, dest="data_root",
                     default=Path(__file__).resolve().parent.parent / "data")
     ap.add_argument("--out", type=Path, default=None,
-                    help="output CSV (default: <data-root>/video_fps.csv)")
+                    help="output CSV (default: <data-dir>/video_fps.csv)")
     ap.add_argument("--workers", type=int, default=8)
-    args = ap.parse_args()
+    return ap
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     out_path = args.out or args.data_root / "video_fps.csv"
 
     videos = sorted(
