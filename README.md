@@ -150,6 +150,18 @@ QC'd/fps-corrected generation — prefer the latter, and feed the resulting
 `qc_flags_*.csv` into Stage 2 below rather than re-running Stage 1 against it
 (Stage 1 is the expensive step; see Step 2).
 
+> **The flags CSV and `_clean.csv` do not share a `frame_idx` key.** `--fix`
+> recomputes `frame_idx = round(frame_timestamp × fps)` for *every* on-disk row,
+> not just the flagged ones, while the flags CSV keeps the original values. A
+> direct `(video_name, frame_idx)` join between them therefore cannot match any
+> `FRAME_IDX_FPS_MISMATCH` row — by construction, those are exactly the rows
+> whose index changed — and silently under-excludes. Anything consuming
+> `--qc-flags` resolves the join through `frame_timestamp` instead
+> (`scripts/qc_exclusions.py`), which is why `calibrate_depth.py`,
+> `benchmark_calibration.py` and `export_calibrated.py` all take an
+> `--annotations-csv`: it tells them which `frame_idx` space the results are in.
+> Unit tests: `python scripts/test_qc_exclusions.py`.
+
 **Step 1 — persist the original depth maps** (adds flags to the eval run):
 
 ```bash
@@ -219,6 +231,7 @@ all points) so accuracy at different ranges is visible, not just one number.
 |---|---|
 | `--calib-level {clip,cam}` | fit one calibrator per clip (default, e.g. one `DSCF0005.AVI`) or pool all clips under one camera-reference folder into a single fit (`cam`; needs `--video-list-xlsx`/`--data-dir`, both default to `data/`) |
 | `--qc-flags PATH` | exclude `(video_name, frame_idx)` rows flagged by Step 0's `qc_annotations.py` before fitting/reporting |
+| `--annotations-csv PATH` | the annotations generation Stage 1 was run against, used to resolve `--qc-flags` into that file's `frame_idx` space (see the join note in Step 0). Defaults to `data/annotations_20260709_with_fps_clean.csv` |
 | `--align {none,ransac}` | optional cross-frame background alignment (`scripts/alignment.py`) before calibration; default `none` since it isn't known ahead of time whether this helps on top of this dataset's already-joint depth inference — compare `calibration_fits.csv`'s `align_*` columns across runs to find out. Needs `--mask-dir` |
 | `--robust` | median-ratio / Theil-Sen fit for `scale`/`linear` instead of least-squares |
 
@@ -238,6 +251,7 @@ for quickly comparing methods before writing any maps). Re-run with a different
 without re-running inference.
 
 Unit tests for the calibration maths: `python scripts/test_calibration.py`.
+For the QC-flag join: `python scripts/test_qc_exclusions.py`.
 
 **Exporting calibrated depth maps + frames** (`scripts/export_calibrated.py`,
 CPU only): bundles Step 2's `*_calib.npy` maps with their source video frames
@@ -263,3 +277,77 @@ the videos under `data/` (via `list_reference_videos.xlsx`). The two dirs stay
 strictly 1:1: a frame that fails to resolve or decode drops its depth map too.
 `--frame-format jpg` trades losslessness for size; `--qc-flags` overrides the
 default `data/qc_flags_annotations_20260709_with_fps.csv`.
+
+## Mask QA pilot
+
+Mask quality gates everything above — Stage-1 alignment, Stage-2 calibration,
+the exported dataset — but nothing in the pipeline measures it.
+`scripts/qa/` is a QA funnel that does, on a fixed 1,000-frame cohort, and
+**measures the dials** so a corpus-scale cost can be extrapolated from numbers
+rather than assumed: how far a free pre-filter cuts the vision-call count
+(`f_v`), the bad-mask rate and failure mix, and how well a cheap verifier agrees
+with a blind human gold set.
+
+| Stage | Script | Runs on |
+|---|---|---|
+| 0 sample | `scripts/qa/sample.py` | login node |
+| 1 masks | `scripts/run_calibration_eval.py` (unchanged; the sample CSV *is* an annotations CSV) | GPU job |
+| 2 pre-filter | `scripts/qa/prefilter.py` — free, no inference | login node |
+| 3a render | `scripts/qa/render_overlays.py` | CPU job |
+| 3b triage | `scripts/qa/triage.py` — Batch API, `submit`/`poll`/`fetch` | login node (needs internet) |
+| 4 review + correct | `scripts/qa/make_review_bundle.py` → `run_review.py` → `scripts/qa/apply_corrections.py` | laptop (review), login node (bundle/apply) |
+| 5 report | `scripts/qa/report.py` — `goldset`, then `summarise` | login node |
+
+```bash
+python scripts/qa/sample.py                       # -> outputs/qa/sample.csv
+bash   slurm/submit.sh stage1_eval                # -> results.csv, masks/
+python scripts/qa/prefilter.py                    # -> f_v
+bash   slurm/submit.sh stage3a_render             # -> overlays/
+python scripts/qa/triage.py estimate              # free: check the bill first
+python scripts/qa/triage.py submit && python scripts/qa/triage.py poll
+python scripts/qa/triage.py fetch                 # -> verdicts_haiku.csv
+python scripts/qa/report.py goldset               # -> blind labelling worksheet
+python scripts/qa/report.py summarise --gold outputs/qa/gold_labelled.csv
+```
+
+**Reviewing the flagged masks (Stage 4).** `scripts/qa/review_server.py` is a
+single-file stdlib HTTP UI over the flagged-bad verdict rows: one large tabbed
+image (original mask / auto-fix preview / zoom / raw frame), button-or-keyboard
+actions (accept, accept auto-fix, draw a SAM3 re-prompt box, discard, skip),
+each decision appended immediately to a `corrections.csv`. Add `--include-ok`
+to also spot-check the unflagged (`verdict=ok`) masks — they queue after the
+flagged classes. The intended way to run it is **locally**, from a
+self-contained tarball:
+
+```bash
+# cluster: pack frames + masks + queue + server into one archive
+python scripts/qa/make_review_bundle.py \
+  --verdicts outputs/qa/verdicts_haiku.csv \
+  --frames-dir outputs/export/frames --masks-dir outputs/qa/masks \
+  --out outputs/qa/review_bundle.tar.gz --include-ok
+# laptop: download, extract, review at http://localhost:8765
+tar xzf review_bundle.tar.gz && cd review_bundle
+pip install -r requirements.txt && python run_review.py
+# cluster: copy corrections.csv back, then apply the deterministic fixes
+python scripts/qa/apply_corrections.py morph \
+  --corrections corrections.csv --masks-dir outputs/qa/masks \
+  --out-masks-dir outputs/qa/masks_corrected
+```
+
+Originals are never touched — corrected mask JSONs go to a parallel directory,
+with an `applied.csv` log (last decision per key wins). `apply_corrections.py
+sam3` (box re-prompts) is a stub until the SAM3 weights arrive. The review tool
+displays the model verdict, so it must **never** be used to label the blind
+gold set — see the protocol in the docs below.
+
+Methodology, gold-set protocol and the pre-registered decision gate:
+[`docs/mask_qa_pilot.md`](docs/mask_qa_pilot.md). SLURM run order, the
+no-egress-on-compute-nodes constraint, and artifact sizes:
+[`slurm/README.md`](slurm/README.md). The committed record of the drawn cohort
+is `docs/qa_cohort_1000.csv`.
+
+Unit tests (no GPU, data, torch, network or API key needed):
+
+```bash
+for t in scripts/test_*.py scripts/qa/test_*.py; do python "$t"; done
+```
