@@ -61,6 +61,16 @@ python scripts/qa/triage.py submit --name haiku
 python scripts/qa/triage.py poll   --name haiku    # re-runnable; safe to disconnect
 python scripts/qa/triage.py fetch  --name haiku    # -> verdicts_haiku.csv
 
+# --- laptop: review the flagged masks (Stage 4; no SLURM job, no tunnel) ---------
+# On the login node, pack everything the review needs into one self-contained tarball:
+python scripts/qa/make_review_bundle.py \
+    --verdicts outputs/qa/verdicts_haiku.csv --frames-dir outputs/export/frames \
+    --masks-dir outputs/qa/masks --out outputs/qa/review_bundle.tar.gz --include-ok
+#   scp it down, tar xzf, python run_review.py; scp corrections.csv back, then:
+python scripts/qa/apply_corrections.py morph \
+    --corrections outputs/qa/corrections.csv --masks-dir outputs/qa/masks \
+    --out-masks-dir outputs/qa/masks_corrected
+
 # --- login node: gold set, then the report ---------------------------------------
 python scripts/qa/report.py goldset          # -> gold_template.csv (blind: no verdicts in it)
 #   ... label gold_verdict by hand, then:

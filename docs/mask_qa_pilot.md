@@ -22,9 +22,11 @@ cost is extrapolated from numbers rather than assumptions:
 for sampling and as a free geometric covariate in the pre-filter. No stage of this pilot scores
 a predicted distance against ground truth.
 
-**Correction is deliberately out of scope.** Choosing correction strategies before the failure
-mix is measured means guessing which ones matter. The decision gate below is what tells us; the
-correction stage is a separate, data-driven piece of work that follows it.
+**Correction is deliberately downstream of measurement.** Choosing correction strategies before
+the failure mix is measured means guessing which ones matter. The decision gate below is what
+tells us. With the pilot's failure mix now measured, the review/correction tooling exists —
+see [Stage 4: review & correction](#stage-4-review--correction) — but nothing it produces
+feeds back into the dials this pilot measures.
 
 ## The funnel
 
@@ -34,6 +36,9 @@ sample.py ──▶ run_calibration_eval.py ──▶ prefilter.py ──▶ ren
    frames                                     │                                       │
                                               ├── empty_mask ──▶ auto-fail (£0)       │
                                               └── clean singleton ──▶ auto-pass       │
+                                                                                      ├──▶ Stage 4 (flagged rows):
+                                                                                      │    make_review_bundle.py ──▶ run_review.py
+                                                                                      │    ──▶ corrections.csv ──▶ apply_corrections.py
                                                                                       ▼
                                     report.py goldset ──▶ hand labels ──▶ report.py summarise
 ```
@@ -97,6 +102,38 @@ making the corpus extrapolation non-comparable.
 Panels pair a full frame with a zoomed crop. `bleed` and `split` are pixel-boundary judgements
 and are read poorly from a full-frame translucent overlay where the subject is 40px tall; the
 full frame is what makes `wrong-subject` and `multiple` visible.
+
+## Stage 4: review & correction
+
+Once triage has flagged masks, a human reviews the flags and records what to do about each.
+Three scripts, all under `scripts/qa/` (details in their docstrings):
+
+- **`review_server.py`** — the review UI: a single-file stdlib HTTP server showing one tabbed
+  image per mask (original SAM-3 mask on the frame, morphology auto-fix preview, zoom, raw
+  frame) with actions *accept* (Haiku false positive), *autofix*, *box* (draw a SAM3 re-prompt
+  box), *discard*, *skip*. Every decision appends immediately to `corrections.csv`
+  (crash-safe; restart resumes; last decision per key wins downstream). The queue is the
+  `result_type=succeeded, verdict != ok` rows grouped by failure class; `--include-ok` appends
+  the unflagged masks at the end for spot-checking Haiku's passes too.
+- **`make_review_bundle.py`** — packs the queue's frames, mask JSONs, verdicts and the server
+  itself into one self-contained tarball so the review runs on a laptop
+  (`python run_review.py`), instead of through an SSH tunnel to the login node. Only the tiny
+  `corrections.csv` is copied back.
+- **`apply_corrections.py`** — turns decisions into corrected mask JSONs in a **parallel
+  output dir** (originals untouched), logging every non-skip decision to `applied.csv`.
+  `morph` (CPU, runnable now) applies the exact auto-fix the reviewer previewed; `sam3`
+  (GPU) will box-prompt re-segmentation and is a stub until the SAM3 weights arrive.
+
+Two hard constraints:
+
+**The review tool must never be used to label the gold set.** It displays the Haiku verdict on
+every item, which breaks rule 2 of the gold-set protocol below. Gold labelling goes through
+`report.py goldset`'s blind worksheet only.
+
+**Prefilter auto-fail rows are not reviewable here.** The `status=empty_mask` frames were
+auto-failed for free and have no exported frame or mask JSON, so the queue cannot show them;
+the server prints this exclusion at startup. Fixing them needs a frame re-export or video
+access — a recorded gap, not a silent drop.
 
 ## Gold set protocol
 

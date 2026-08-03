@@ -295,10 +295,8 @@ with a blind human gold set.
 | 2 pre-filter | `scripts/qa/prefilter.py` — free, no inference | login node |
 | 3a render | `scripts/qa/render_overlays.py` | CPU job |
 | 3b triage | `scripts/qa/triage.py` — Batch API, `submit`/`poll`/`fetch` | login node (needs internet) |
+| 4 review + correct | `scripts/qa/make_review_bundle.py` → `run_review.py` → `scripts/qa/apply_corrections.py` | laptop (review), login node (bundle/apply) |
 | 5 report | `scripts/qa/report.py` — `goldset`, then `summarise` | login node |
-
-Correction (Stage 4) is deliberately deferred: which strategies are worth
-building is exactly what the measured failure mix is supposed to decide.
 
 ```bash
 python scripts/qa/sample.py                       # -> outputs/qa/sample.csv
@@ -311,6 +309,36 @@ python scripts/qa/triage.py fetch                 # -> verdicts_haiku.csv
 python scripts/qa/report.py goldset               # -> blind labelling worksheet
 python scripts/qa/report.py summarise --gold outputs/qa/gold_labelled.csv
 ```
+
+**Reviewing the flagged masks (Stage 4).** `scripts/qa/review_server.py` is a
+single-file stdlib HTTP UI over the flagged-bad verdict rows: one large tabbed
+image (original mask / auto-fix preview / zoom / raw frame), button-or-keyboard
+actions (accept, accept auto-fix, draw a SAM3 re-prompt box, discard, skip),
+each decision appended immediately to a `corrections.csv`. Add `--include-ok`
+to also spot-check the unflagged (`verdict=ok`) masks — they queue after the
+flagged classes. The intended way to run it is **locally**, from a
+self-contained tarball:
+
+```bash
+# cluster: pack frames + masks + queue + server into one archive
+python scripts/qa/make_review_bundle.py \
+  --verdicts outputs/qa/verdicts_haiku.csv \
+  --frames-dir outputs/export/frames --masks-dir outputs/qa/masks \
+  --out outputs/qa/review_bundle.tar.gz --include-ok
+# laptop: download, extract, review at http://localhost:8765
+tar xzf review_bundle.tar.gz && cd review_bundle
+pip install -r requirements.txt && python run_review.py
+# cluster: copy corrections.csv back, then apply the deterministic fixes
+python scripts/qa/apply_corrections.py morph \
+  --corrections corrections.csv --masks-dir outputs/qa/masks \
+  --out-masks-dir outputs/qa/masks_corrected
+```
+
+Originals are never touched — corrected mask JSONs go to a parallel directory,
+with an `applied.csv` log (last decision per key wins). `apply_corrections.py
+sam3` (box re-prompts) is a stub until the SAM3 weights arrive. The review tool
+displays the model verdict, so it must **never** be used to label the blind
+gold set — see the protocol in the docs below.
 
 Methodology, gold-set protocol and the pre-registered decision gate:
 [`docs/mask_qa_pilot.md`](docs/mask_qa_pilot.md). SLURM run order, the
