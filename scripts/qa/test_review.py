@@ -44,7 +44,7 @@ def _row(video="pnt_v1_cam1_A", frame=10, inst=0, verdict="split",
 
 def _decision(video="v", frame=5, inst=0, action="autofix", box=("", "", "", "")):
     return {"key": f"{video}|{frame}|{inst}", "video_name": video, "frame_idx": str(frame),
-            "instance_idx": str(inst), "haiku_verdict": "split", "action": action,
+            "instance_idx": str(inst), "source_verdict": "split", "action": action,
             "box_x0": box[0], "box_y0": box[1], "box_x1": box[2], "box_y1": box[3],
             "notes": "", "decided_at": "2026-08-02T00:00:00+00:00"}
 

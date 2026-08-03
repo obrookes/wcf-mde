@@ -39,7 +39,7 @@ from scripts.masks import load_instance_masks, mask_path, save_instance_masks  #
 from scripts.qa.review_server import autofix_mask, load_decisions  # noqa: E402
 
 APPLIED_FIELDS = [
-    "key", "video_name", "frame_idx", "instance_idx", "haiku_verdict", "action",
+    "key", "video_name", "frame_idx", "instance_idx", "source_verdict", "action",
     "disposition", "area_before", "area_after", "out_path", "error",
 ]
 
@@ -52,7 +52,7 @@ def apply_morph(decisions: dict[str, dict], masks_dir: Path,
     for key in sorted(decisions):
         d = decisions[key]
         base = {"key": key, "video_name": d["video_name"], "frame_idx": d["frame_idx"],
-                "instance_idx": d["instance_idx"], "haiku_verdict": d["haiku_verdict"],
+                "instance_idx": d["instance_idx"], "source_verdict": d["source_verdict"],
                 "action": d["action"], "area_before": "", "area_after": "",
                 "out_path": "", "error": ""}
         action = d["action"]

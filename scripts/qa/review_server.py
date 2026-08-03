@@ -1,11 +1,11 @@
 #!/usr/bin/env python
-"""Minimalist human review UI for the Haiku-flagged bad masks — a single-file stdlib HTTP
+"""Minimalist human review UI for the triage-flagged bad masks — a single-file stdlib HTTP
 server. The intended way to run it is LOCALLY, from a self-contained bundle built by
 make_review_bundle.py (download the tarball, `python run_review.py`, browse localhost:8765 —
 see the bundle's README.txt). It can also run on the login node through an SSH tunnel:
 
     python scripts/qa/review_server.py \
-        --verdicts  .../qa_pilot/verdicts_haiku.csv \
+        --verdicts  .../qa_pilot/verdicts.csv \
         --frames-dir .../export_test/frames \
         --masks-dir  .../export_test/masks \
         --out       .../qa_pilot/corrections.csv
@@ -13,8 +13,8 @@ see the bundle's README.txt). It can also run on the login node through an SSH t
 
 The queue is every verdict row with `result_type=succeeded` and `verdict != ok`, grouped by
 failure class. Pass `--include-ok` to also review the unflagged masks (they queue after the
-flagged classes, with a green OK chip) — spot-checking Haiku's passes, not just its fails.
-For each mask the page shows ONE large image with tabs: the original SAM-3
+flagged classes, with a green OK chip) — spot-checking the triage backend's passes, not just
+its fails. For each mask the page shows ONE large image with tabs: the original SAM-3
 mask rendered on the frame (green = the instance under review, yellow = other instances in
 the frame), a deterministic morphology auto-fix preview (largest connected component + hole
 fill), a zoomed crop of the mask region, and the raw frame. Correction boxes are drawn in an
@@ -22,7 +22,7 @@ explicit draw mode (Draw box button → drag → Save). One decision appends a r
 corrections CSV — flushed per write, so killing the server loses nothing and restarting
 resumes where you left off (re-deciding a key appends again; last write wins downstream).
 
-Actions: accept (mask is actually fine — Haiku false positive), autofix (morphology preview is
+Actions: accept (mask is actually fine — triage false positive), autofix (morphology preview is
 right), box (re-prompt SAM3 with the drawn box later, via apply_corrections.py once the weights
 arrive), discard (unfixable — exclude the frame), skip.
 
@@ -53,7 +53,7 @@ from scripts.qa.verdicts_schema import BAD_CLASSES, key_of  # noqa: E402
 
 ACTIONS = {"accept", "autofix", "box", "discard", "skip"}
 CORRECTION_FIELDS = [
-    "key", "video_name", "frame_idx", "instance_idx", "haiku_verdict", "action",
+    "key", "video_name", "frame_idx", "instance_idx", "source_verdict", "action",
     "box_x0", "box_y0", "box_x1", "box_y1", "notes", "decided_at",
 ]
 
@@ -125,7 +125,11 @@ def load_decisions(path: Path) -> dict[str, dict]:
     if not path.exists() or path.stat().st_size == 0:
         return {}
     with open(path, newline="") as f:
-        return {r["key"]: r for r in csv.DictReader(f)}
+        rows = {}
+        for r in csv.DictReader(f):
+            r.setdefault("source_verdict", r.get("haiku_verdict", ""))
+            rows[r["key"]] = r
+        return rows
 
 
 def append_decision(path: Path, row: dict) -> None:
@@ -248,7 +252,8 @@ class ReviewApp:
             "index": i, "key": key_of(item),
             "video_name": item["video_name"], "frame_idx": item["frame_idx"],
             "instance_idx": item["instance_idx"], "site": item.get("site", ""),
-            "verdict": item["verdict"], "confidence": item.get("confidence", ""),
+            "verdict": item["verdict"], "model": item.get("model", ""),
+            "confidence": item.get("confidence", ""),
             "rationale": item.get("rationale", ""), "flags": item.get("flags", ""),
             "prefilter_class": item.get("prefilter_class", ""),
         }
@@ -273,7 +278,7 @@ class ReviewApp:
         row = {
             "key": key_of(item), "video_name": item["video_name"],
             "frame_idx": item["frame_idx"], "instance_idx": item["instance_idx"],
-            "haiku_verdict": item["verdict"], "action": action,
+            "source_verdict": item["verdict"], "action": action,
             "box_x0": box[0], "box_y0": box[1], "box_x1": box[2], "box_y1": box[3],
             "notes": (payload.get("notes") or "").replace("\n", " ").strip(),
             "decided_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -415,6 +420,7 @@ PAGE = """<!doctype html>
                    color: #fff; font-weight: 600; text-transform: uppercase;
                    font-size: 12px; letter-spacing: .04em; }
   #info .verdict.ok { background: #2d6a2d; }
+  #info .model { color: #9ab; }
   #info .conf { color: #9ab; }
   #info .rationale { color: #ccd; flex: 1 1 22em; }
   #info .flags { color: #667; font-size: 12px; }
@@ -551,7 +557,8 @@ function render() {
   $('info').innerHTML =
     '<span class="verdict' + (it.verdict === 'ok' ? ' ok' : '') + '">' +
       esc(it.verdict) + '</span>' +
-    '<span class="conf">conf ' + esc(it.confidence) + '</span>' +
+    (it.model ? '<span class="model">' + esc(it.model) + '</span>' : '') +
+    (it.confidence ? '<span class="conf">conf ' + esc(it.confidence) + '</span>' : '') +
     '<span class="rationale">' + esc(it.rationale) + '</span>' +
     (it.flags ? '<span class="flags">[' + esc(it.flags) + ']</span>' : '') +
     (d ? '<span class="done">decided: ' + esc(d.action) + '</span>' : '');
