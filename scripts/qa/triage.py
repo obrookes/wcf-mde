@@ -39,13 +39,12 @@ from pathlib import Path
 import cv2
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.qa.verdicts_schema import VERDICT_CLASSES, VERDICT_FIELDS  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 TRIAGE_MODEL = "claude-haiku-4-5"
 ESCALATION_MODEL = "claude-opus-5"
-
-VERDICT_CLASSES = ["ok", "empty", "wrong-subject", "bleed", "split", "multiple"]
 
 # Numerical/string constraints (minimum, maximum, minLength) are not supported by structured
 # outputs, so confidence is clamped client-side instead of constrained here.
@@ -89,12 +88,6 @@ If more than one applies, pick the one that would most mislead a downstream dist
 Set "confidence" between 0.0 and 1.0 -- your own probability that this verdict is correct. Be \
 honest: low confidence routes the panel to a stronger reviewer, which is the desired outcome \
 when the panel is genuinely ambiguous. Keep "rationale" to one short sentence."""
-
-VERDICT_FIELDS = [
-    "custom_id", "video_name", "frame_idx", "instance_idx", "site", "stratum",
-    "prefilter_class", "flags", "model", "verdict", "confidence", "rationale",
-    "result_type", "error", "overlay_path",
-]
 
 # Batch API limits (a request is rejected wholesale if either is exceeded).
 MAX_REQUESTS_PER_BATCH = 100_000

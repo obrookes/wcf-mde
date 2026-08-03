@@ -21,13 +21,10 @@ import json
 import os
 import sys
 from collections import Counter
+from pathlib import Path
 
-VERDICT_CLASSES = {"ok", "empty", "wrong-subject", "bleed", "split", "multiple"}
-VERDICT_FIELDS = [
-    "custom_id", "video_name", "frame_idx", "instance_idx", "site", "stratum",
-    "prefilter_class", "flags", "model", "verdict", "confidence", "rationale",
-    "result_type", "error", "overlay_path",
-]
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.qa.verdicts_schema import VERDICT_CLASSES, VERDICT_FIELDS  # noqa: E402
 
 
 def main() -> None:

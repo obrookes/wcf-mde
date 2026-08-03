@@ -35,12 +35,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.qa.triage import (
-    ESCALATION_MODEL,
-    TRIAGE_MODEL,
-    VERDICT_CLASSES,
-    estimate_cost,
-)
+from scripts.qa.triage import ESCALATION_MODEL, TRIAGE_MODEL, estimate_cost
+from scripts.qa.verdicts_schema import VERDICT_CLASSES, key_of
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -207,10 +203,6 @@ def fit_threshold(rows: list[dict]) -> tuple[float, dict]:
 # --------------------------------------------------------------------------------------
 # I/O
 # --------------------------------------------------------------------------------------
-
-def key_of(row: dict) -> str:
-    return f"{row.get('video_name','')}|{row.get('frame_idx','')}|{row.get('instance_idx','')}"
-
 
 def read_csv(path: Path) -> list[dict]:
     with open(path, newline="") as f:

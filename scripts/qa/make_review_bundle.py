@@ -33,10 +33,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.masks import mask_path  # noqa: E402
-from scripts.qa.review_server import BAD_CLASSES, build_queue, frame_filename  # noqa: E402
+from scripts.qa.review_server import build_queue, frame_filename  # noqa: E402
+from scripts.qa.verdicts_schema import BAD_CLASSES  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUNDLED_CODE = ["scripts/masks.py", "scripts/qa/review_server.py"]
+BUNDLED_CODE = ["scripts/masks.py", "scripts/qa/verdicts_schema.py", "scripts/qa/review_server.py"]
 
 REQUIREMENTS = """\
 numpy

@@ -49,8 +49,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.masks import load_instance_masks  # noqa: E402
+from scripts.qa.verdicts_schema import BAD_CLASSES, key_of  # noqa: E402
 
-BAD_CLASSES = ["empty", "wrong-subject", "bleed", "split", "multiple"]
 ACTIONS = {"accept", "autofix", "box", "discard", "skip"}
 CORRECTION_FIELDS = [
     "key", "video_name", "frame_idx", "instance_idx", "haiku_verdict", "action",
@@ -60,10 +60,6 @@ CORRECTION_FIELDS = [
 # --------------------------------------------------------------------------------------
 # pure logic (unit-tested in test_review.py)
 # --------------------------------------------------------------------------------------
-
-
-def key_of(row: dict) -> str:
-    return f"{row['video_name']}|{row['frame_idx']}|{row['instance_idx']}"
 
 
 def frame_filename(video_name: str, frame_idx: int | str) -> str:

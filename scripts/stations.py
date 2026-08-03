@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import re
 
+from scripts.sites import site_of  # noqa: F401,E402 - re-exported; callers import it from here
+
 FRAME_RE = re.compile(r"^(?P<video_name>.+)_frame(?P<frame_idx>\d{6})\.(?:png|jpg|jpeg)$")
 MASK_RE = re.compile(r"^(?P<video_name>.+)_frame(?P<frame_idx>\d{6})_masks\.json$")
 DEPTH_RE = re.compile(r"^(?P<video_name>.+)_frame(?P<frame_idx>\d{6})_calib\.npy$")
@@ -45,15 +47,6 @@ def parse_mask_name(name: str) -> tuple[str, int] | None:
 
 def parse_depth_name(name: str) -> tuple[str, int] | None:
     return _parse(DEPTH_RE, name)
-
-
-def site_of(video_name: str) -> str:
-    """Leading path component: mafou, pss, pnt, kora, beauvois, mbnp, fello.
-
-    Mirrors scripts/qc_annotations.py::site_of; duplicated rather than imported so this
-    module stays free of the pandas dependency.
-    """
-    return video_name.split("_", 1)[0]
 
 
 def station_of(video_name: str) -> str:
