@@ -12,7 +12,9 @@ see the bundle's README.txt). It can also run on the login node through an SSH t
     # laptop:  ssh -L 8765:localhost:8765 <login-node>  ->  http://localhost:8765
 
 The queue is every verdict row with `result_type=succeeded` and `verdict != ok`, grouped by
-failure class. For each mask the page shows ONE large image with tabs: the original SAM-3
+failure class. Pass `--include-ok` to also review the unflagged masks (they queue after the
+flagged classes, with a green OK chip) — spot-checking Haiku's passes, not just its fails.
+For each mask the page shows ONE large image with tabs: the original SAM-3
 mask rendered on the frame (green = the instance under review, yellow = other instances in
 the frame), a deterministic morphology auto-fix preview (largest connected component + hole
 fill), a zoomed crop of the mask region, and the raw frame. Correction boxes are drawn in an
@@ -69,11 +71,17 @@ def frame_filename(video_name: str, frame_idx: int | str) -> str:
     return f"{video_name}_frame{int(frame_idx):06d}.png"
 
 
-def build_queue(rows: list[dict], only_classes: list[str] | None = None) -> list[dict]:
-    """Verdict-CSV rows -> ordered review queue: succeeded, flagged-bad rows sorted by
-    failure class (grouping like failures makes review fast), then video/frame/instance."""
-    classes = set(only_classes) if only_classes else set(BAD_CLASSES)
-    order = {c: i for i, c in enumerate(BAD_CLASSES)}
+def build_queue(rows: list[dict], only_classes: list[str] | None = None,
+                include_ok: bool = False) -> list[dict]:
+    """Verdict-CSV rows -> ordered review queue: succeeded rows sorted by failure class
+    (grouping like failures makes review fast), then video/frame/instance. By default only
+    flagged-bad rows; `include_ok` appends the ok-verdict rows after the flagged classes.
+    An explicit `only_classes` (which may name "ok") overrides both."""
+    if only_classes:
+        classes = set(only_classes)
+    else:
+        classes = set(BAD_CLASSES) | ({"ok"} if include_ok else set())
+    order = {c: i for i, c in enumerate(BAD_CLASSES)}  # "ok" is absent -> sorts last
     queue = [r for r in rows
              if r.get("result_type") == "succeeded" and r.get("verdict") in classes]
     queue.sort(key=lambda r: (order.get(r["verdict"], len(order)), r["video_name"],
@@ -213,6 +221,8 @@ class ReviewApp:
         self.masks_dir = Path(masks_dir)
         self.out_csv = Path(out_csv)
         self.decisions = load_decisions(out_csv)
+        present = {it["verdict"] for it in queue}
+        self.classes = [c for c in BAD_CLASSES + ["ok"] if c in present]
         self.lock = threading.Lock()
 
     def frame_path(self, item: dict) -> Path:
@@ -320,7 +330,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({
                     "items": [app.item_json(i, it) for i, it in enumerate(app.queue)],
                     "decisions": app.decisions,
-                    "classes": BAD_CLASSES,
+                    "classes": app.classes,
                 })
             elif self.path.startswith("/mask/"):
                 item = self._item("/mask/")
@@ -408,6 +418,7 @@ PAGE = """<!doctype html>
   #info .verdict { padding: .15em .6em; border-radius: 3px; background: #7c2d2d;
                    color: #fff; font-weight: 600; text-transform: uppercase;
                    font-size: 12px; letter-spacing: .04em; }
+  #info .verdict.ok { background: #2d6a2d; }
   #info .conf { color: #9ab; }
   #info .rationale { color: #ccd; flex: 1 1 22em; }
   #info .flags { color: #667; font-size: 12px; }
@@ -542,7 +553,8 @@ function render() {
   $('pos').textContent = '#' + (pos + 1) + '  ' + it.key;
   const d = decisions[it.key];
   $('info').innerHTML =
-    '<span class="verdict">' + esc(it.verdict) + '</span>' +
+    '<span class="verdict' + (it.verdict === 'ok' ? ' ok' : '') + '">' +
+      esc(it.verdict) + '</span>' +
     '<span class="conf">conf ' + esc(it.confidence) + '</span>' +
     '<span class="rationale">' + esc(it.rationale) + '</span>' +
     (it.flags ? '<span class="flags">[' + esc(it.flags) + ']</span>' : '') +
@@ -667,8 +679,11 @@ def parse_args() -> argparse.Namespace:
                    help="corrections CSV to append decisions to "
                         "(default: corrections.csv next to --verdicts)")
     p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--only-class", action="append", choices=BAD_CLASSES, default=None,
+    p.add_argument("--only-class", action="append", choices=BAD_CLASSES + ["ok"],
+                   default=None,
                    help="restrict the queue to these verdict classes (repeatable)")
+    p.add_argument("--include-ok", action="store_true",
+                   help="also queue the unflagged (verdict=ok) masks, after the flagged ones")
     return p.parse_args()
 
 
@@ -677,12 +692,12 @@ def main() -> None:
     out_csv = args.out or args.verdicts.parent / "corrections.csv"
     with open(args.verdicts, newline="") as f:
         rows = list(csv.DictReader(f))
-    queue = build_queue(rows, args.only_class)
+    queue = build_queue(rows, args.only_class, args.include_ok)
     app = ReviewApp(queue, args.frames_dir, args.masks_dir, out_csv)
 
     from collections import Counter
     mix = Counter(it["verdict"] for it in queue)
-    print(f"queue: {len(queue)} flagged masks "
+    print(f"queue: {len(queue)} masks "
           f"({', '.join(f'{c} {n}' for c, n in mix.most_common())})", flush=True)
     print(f"decisions so far: {len(app.decisions)} (appending to {out_csv})", flush=True)
     print("note: prefilter auto-fail rows (status=empty_mask) are not in the verdicts CSV and "

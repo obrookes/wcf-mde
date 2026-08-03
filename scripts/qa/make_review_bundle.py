@@ -2,10 +2,11 @@
 """Pack everything the bad-mask review UI needs into one self-contained tarball, so the
 review runs on a laptop instead of through an SSH tunnel to the login node.
 
-Collects, for every flagged-bad verdict row (same queue rule as review_server.py): the raw
-frame PNG and the mask JSON (the UI renders all its views from those two); plus the verdicts
-CSV (bad rows only), the server code itself, a `run_review.py` launcher, a requirements.txt
-and a README. The result extracts to `review_bundle/` and runs with:
+Collects, for every flagged-bad verdict row (same queue rule as review_server.py — add
+`--include-ok` to also bundle the unflagged masks for spot-checking): the raw frame PNG and
+the mask JSON (the UI renders all its views from those two); plus the verdicts CSV (queue
+rows only), the server code itself, a `run_review.py` launcher, a requirements.txt and a
+README. The result extracts to `review_bundle/` and runs with:
 
     pip install -r requirements.txt
     python run_review.py            # then open http://localhost:8765
@@ -58,9 +59,10 @@ import sys
 ROOT = os.path.dirname(os.path.abspath(__file__))
 os.chdir(ROOT)  # overlay paths in verdicts.csv are bundle-relative
 sys.path.insert(0, ROOT)
-# defaults first, so any explicitly passed flags win (argparse: last occurrence wins)
+# defaults first, so any explicitly passed flags win (argparse: last occurrence wins).
+# --include-ok is a no-op unless the bundle was built with ok rows in verdicts.csv.
 sys.argv[1:1] = ["--verdicts", "verdicts.csv", "--frames-dir", "frames",
-                 "--masks-dir", "masks", "--out", "corrections.csv"]
+                 "--masks-dir", "masks", "--out", "corrections.csv", "--include-ok"]
 
 from scripts.qa.review_server import main
 
@@ -82,6 +84,10 @@ crop, and the raw frame (keys 1-4). Actions are buttons (with shortcuts): Mask i
 (a), Accept auto-fix (f), Draw box (b: drag on the image, then Enter to save), Discard
 (d), Skip (s); arrows navigate, Esc cancels drawing.
 
+If the bundle was built with --include-ok, the unflagged (ok-verdict) masks appear at the
+end of the queue with a green OK chip — confirm them with "Mask is fine" or override with
+any other action; use the class filter dropdown to jump straight to them.
+
 Every keypress appends to corrections.csv in this directory immediately — you can stop
 and restart run_review.py at any time and it resumes; re-deciding a key is fine (the
 last decision wins downstream).
@@ -101,11 +107,11 @@ blind gold set.
 
 
 def stage_bundle(rows: list[dict], frames_dir: Path, masks_dir: Path, stage: Path,
-                 only_classes: list[str] | None = None,
+                 only_classes: list[str] | None = None, include_ok: bool = False,
                  repo_root: Path = REPO_ROOT) -> dict:
     """Copy the minimal file set for the review queue into `stage`. Returns stats incl. a
     `missing` list of (kind, path) for anything a queue row references that isn't on disk."""
-    queue = build_queue(rows, only_classes)
+    queue = build_queue(rows, only_classes, include_ok)
     if not queue:
         raise SystemExit("queue is empty — nothing to bundle")
 
@@ -158,8 +164,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--frames-dir", type=Path, required=True)
     p.add_argument("--masks-dir", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True, help="output .tar.gz path")
-    p.add_argument("--only-class", action="append", choices=BAD_CLASSES, default=None,
+    p.add_argument("--only-class", action="append", choices=BAD_CLASSES + ["ok"],
+                   default=None,
                    help="restrict to these verdict classes (repeatable)")
+    p.add_argument("--include-ok", action="store_true",
+                   help="also bundle the unflagged (verdict=ok) masks for spot-checking")
     p.add_argument("--allow-missing", action="store_true",
                    help="tar anyway when some referenced files are absent")
     return p.parse_args()
@@ -172,7 +181,8 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(dir=args.out.parent) as td:
         stage = Path(td) / "review_bundle"
-        stats = stage_bundle(rows, args.frames_dir, args.masks_dir, stage, args.only_class)
+        stats = stage_bundle(rows, args.frames_dir, args.masks_dir, stage,
+                             args.only_class, args.include_ok)
         print(f"queue {stats['queue']}: staged {stats['frames']} frames, "
               f"{stats['masks']} mask JSONs")
         if stats["missing"]:

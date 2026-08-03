@@ -86,6 +86,21 @@ def test_build_queue_only_classes():
     assert [r["verdict"] for r in queue] == ["bleed"]
 
 
+def test_build_queue_include_ok():
+    rows = [_row(frame=1, verdict="ok"), _row(frame=2, verdict="split"),
+            _row(frame=3, verdict="ok", result_type="errored"),
+            _row(frame=4, verdict="empty")]
+    # default: ok excluded
+    assert [r["verdict"] for r in build_queue(rows)] == ["empty", "split"]
+    # include_ok: ok rows queue after every flagged class; errored still excluded
+    got = build_queue(rows, include_ok=True)
+    assert [r["verdict"] for r in got] == ["empty", "split", "ok"]
+    # explicit only_classes overrides, and may itself name ok
+    assert [r["verdict"] for r in build_queue(rows, only_classes=["ok"])] == ["ok"]
+    assert [r["verdict"] for r in build_queue(rows, only_classes=["split"],
+                                              include_ok=True)] == ["split"]
+
+
 def test_key_of():
     assert key_of(_row(video="v", frame=7, inst=2)) == "v|7|2"
 
@@ -361,6 +376,18 @@ def test_stage_bundle_end_to_end():
         for rel in ("scripts/qa/review_server.py", "scripts/masks.py", "run_review.py",
                     "requirements.txt", "README.txt"):
             assert (stage / rel).exists(), rel
+
+
+def test_stage_bundle_include_ok():
+    with tempfile.TemporaryDirectory() as t:
+        td = Path(t)
+        frames_dir, masks_dir = _seed_bundle_inputs(td, [("vidA", 1), ("vidB", 2)])
+        rows = [_row(video="vidA", frame=1, verdict="split"),
+                _row(video="vidB", frame=2, verdict="ok")]
+        stats = stage_bundle(rows, frames_dir, masks_dir, td / "stage", include_ok=True)
+        assert stats == {"queue": 2, "frames": 2, "masks": 2, "missing": []}
+        with open(td / "stage" / "verdicts.csv", newline="") as f:
+            assert [r["verdict"] for r in csv.DictReader(f)] == ["split", "ok"]
 
 
 def test_stage_bundle_reports_missing():
