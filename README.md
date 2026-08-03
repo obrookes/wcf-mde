@@ -278,7 +278,50 @@ strictly 1:1: a frame that fails to resolve or decode drops its depth map too.
 `--frame-format jpg` trades losslessness for size; `--qc-flags` overrides the
 default `data/qc_flags_annotations_20260709_with_fps.csv`.
 
+## Mask QA — how the pieces fit
+
+Two interchangeable backends triage SAM-3 masks and converge on one contract, the
+verdicts CSV (`VERDICT_FIELDS`, defined in `scripts/qa/verdicts_schema.py`):
+
+```
+export (frames+masks)
+  ├─ A: prefilter → render_overlays → triage (VLM, paid) ──┐
+  └─ B: score_masks → heuristic_verdicts (CPU, free) ──────┴─▶ verdicts.csv
+                                                                    │
+      review_server → corrections.csv → apply_corrections ◀─────────┘
+```
+
+**Path A — VLM triage (Batch API, paid; details: [Mask QA pilot](#mask-qa-pilot)):**
+
+```bash
+python scripts/qa/prefilter.py                        # -> outputs/qa/prefilter.csv (f_v)
+python scripts/qa/render_overlays.py                   # -> outputs/qa/overlays/, overlay_manifest.csv
+python scripts/qa/triage.py estimate                   # free: check the bill first
+python scripts/qa/triage.py submit && python scripts/qa/triage.py poll
+python scripts/qa/triage.py fetch                      # -> outputs/qa/verdicts_haiku.csv
+```
+
+**Path B — CPU heuristics (free, no API key, no GPU; details: [Mask triage](#mask-triage)):**
+
+```bash
+python scripts/score_masks.py --export-dir outputs/export --out-dir outputs/triage \
+  --workers 12                                         # -> mask_scores.csv, review_queue.csv
+python scripts/qa/heuristic_verdicts.py --scores outputs/triage/mask_scores.csv \
+  --out outputs/qa/verdicts_heuristic.csv
+python scripts/triage_contact_sheet.py --scores outputs/triage/mask_scores.csv \
+  --export-dir outputs/export --out outputs/triage/worst.png --top 24  # eyeball the worst
+```
+
+B is the free first pass — no API key or GPU, just the mask JSONs and frames already on disk;
+A costs money but reads the actual pixels through a VLM and is the only one of the two that can
+tell "bleed" from "multiple" apart. Either output slots into the same downstream tooling: any
+script that accepts `--verdicts` (`review_server.py`, `make_review_bundle.py`) takes A's or B's
+CSV interchangeably.
+
 ## Mask QA pilot
+
+See [Mask QA — how the pieces fit](#mask-qa--how-the-pieces-fit) for how this (the VLM path)
+relates to the CPU-heuristic path in [Mask triage](#mask-triage).
 
 Mask quality gates everything above — Stage-1 alignment, Stage-2 calibration,
 the exported dataset — but nothing in the pipeline measures it.
@@ -352,6 +395,9 @@ Unit tests (no GPU, data, torch, network or API key needed):
 for t in scripts/test_*.py scripts/qa/test_*.py; do python "$t"; done
 ```
 ## Mask triage
+
+See [Mask QA — how the pieces fit](#mask-qa--how-the-pieces-fit) for how this (the CPU-heuristic
+path) relates to the VLM path in [Mask QA pilot](#mask-qa-pilot).
 
 `scripts/score_masks.py` (CPU only) scores every predicted SAM-3 mask in an
 export directory and ranks a human review queue. It answers one question —
@@ -446,5 +492,13 @@ own signal distributions so each flag fires on a tail rather than on the bulk;
 turning `auto_accept` into a claim about precision needs a labelled gold set,
 which doesn't exist yet. Until then the bucket is a sort order and the flag
 reasons are the product.
+
+`review_queue.csv` and the contact sheets are as far as this table format goes on its own —
+neither is a verdicts CSV. `scripts/qa/heuristic_verdicts.py` is the bridge into review: it
+projects `mask_scores.csv`'s flags into a `VERDICT_FIELDS` row per mask (deriving `verdict` from
+the fired flags; see its module docstring for the exact flag → verdict table), so
+`review_server.py`, `make_review_bundle.py` and `apply_corrections.py` run on this backend's
+output exactly as they do on `triage.py`'s. See [Mask QA — how the pieces
+fit](#mask-qa--how-the-pieces-fit) for the copy-pasteable path.
 
 Unit tests: `python scripts/test_mask_signals.py` (synthetic, no GPU/data).

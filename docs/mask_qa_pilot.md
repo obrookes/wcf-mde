@@ -103,6 +103,63 @@ Panels pair a full frame with a zoomed crop. `bleed` and `split` are pixel-bound
 and are read poorly from a full-frame translucent overlay where the subject is 40px tall; the
 full frame is what makes `wrong-subject` and `multiple` visible.
 
+## Two interchangeable triage backends
+
+Stage 3b above (`triage.py`, the VLM) is one of two backends that can produce the verdicts CSV
+Stage 4 reads. The other, `scripts/score_masks.py` + `scripts/qa/heuristic_verdicts.py`, is CPU
+only, free, and needs neither an API key nor this pilot's sampled cohort — it scores whatever
+export directory it's pointed at. Both end in the same shape, so Stage 4 does not care which one
+produced its input.
+
+**Path A (this pilot, Batch API):**
+
+```bash
+python scripts/qa/prefilter.py
+python scripts/qa/render_overlays.py
+python scripts/qa/triage.py submit && python scripts/qa/triage.py poll
+python scripts/qa/triage.py fetch                       # -> outputs/qa/verdicts_haiku.csv
+```
+
+or, via the in-session-subagent alternative documented in `merge_verdicts.py`'s docstring:
+
+```bash
+python scripts/qa/merge_verdicts.py --manifest outputs/qa/overlay_manifest.csv \
+  --chunks 'verdict_chunks/chunk_*_verdicts.json' --out outputs/qa/verdicts_haiku.csv
+```
+
+**Path B (CPU heuristics):**
+
+```bash
+python scripts/score_masks.py --export-dir outputs/export --out-dir outputs/triage --workers 12
+python scripts/qa/heuristic_verdicts.py --scores outputs/triage/mask_scores.csv \
+  --out outputs/qa/verdicts_heuristic.csv
+```
+
+**The contract.** Both paths write exactly the `VERDICT_FIELDS` columns defined in
+`scripts/qa/verdicts_schema.py`, in that order, and nothing downstream reads a row unless
+`result_type == "succeeded"` (`RESULT_SUCCEEDED`) — `report.py` and `review_server.py` both gate
+on this before touching `verdict`. **Backend B never emits `"multiple"`**: no signal in
+`score_masks.py` distinguishes "one mask, two subjects" from "one mask, bled boundary" without a
+model looking at the panel, so its `verdict` is always one of `{ok, empty, wrong-subject, bleed,
+split}`. `confidence` is not a calibrated probability on either path, and the two are not on the
+same scale — Path A's is the VLM's own stated probability for its verdict; Path B's is a fixed
+per-bucket value or a squashed `triage_score` (see `heuristic_verdicts.py`'s docstring). Treat
+each backend's confidence as an ordinal ranking within that backend, never as a number to compare
+or average across the two.
+
+**`frame_scores.csv` is a Backend-B side product, outside this contract.** It's
+`score_masks.py`'s exhaustivity signal — one row per frame, asking whether a subject-sized piece
+of the scene changed with no mask over it — and has no analogue on Path A and no place in the
+verdicts CSV; don't expect it to join against anything Stage 4 reads.
+
+**`prefilter.py` and `mask_signals.py` are deliberately not merged**, despite both computing
+mask-quality signals from disk artifacts. `prefilter.py` decides which of *this pilot's* sampled
+masks are cheap enough to skip the paid VLM call (`f_v`); `scripts/mask_signals.py` (consumed by
+`score_masks.py`) is Backend B's own free-standing signal set, scored over a full export rather
+than the pilot's 1,000-frame cohort. They answer different questions at different scales, and
+sharing a signal library would couple gating a paid call to running a free backend that has no
+need of one.
+
 ## Stage 4: review & correction
 
 Once triage has flagged masks, a human reviews the flags and records what to do about each.
