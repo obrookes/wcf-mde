@@ -39,6 +39,12 @@ free and it saves re-running inference if you later want to calibrate this cohor
 
 ## Run order
 
+`bash slurm/pipeline.sh all --with-cohort` (see [The pipeline driver](#the-pipeline-driver-slurmpipelinesh)
+below) now drives this whole funnel — plus the main fps/qc/infer/calibrate/export/score funnel
+from README.md, in parallel on GPU — non-interactively up to the same `verdicts`/`report`
+hand-off documented below. The by-hand sequence in this section remains valid stage-by-stage; it
+is exactly what each `pipeline.sh` subcommand wraps.
+
 ```bash
 # --- login node ------------------------------------------------------------------
 python scripts/qa/test_prefilter.py          # and the other test_*.py; all offline
@@ -88,6 +94,50 @@ python scripts/qa/triage.py fetch --name opus
 python scripts/qa/report.py summarise --gold outputs/qa/gold_labelled.csv \
     --escalated-verdicts outputs/qa/verdicts_opus.csv
 ```
+
+## The pipeline driver (`slurm/pipeline.sh`)
+
+`slurm/pipeline.sh` is a resumable driver over both funnels above — the main README.md
+fps/qc/infer/calibrate/export/score sequence and the QA-pilot cohort funnel on this page — not a
+replacement job script. It reuses the same two job shapes already on this page under new names:
+
+- **`pipeline_infer.sbatch`** — the GPU job, wraps `run_calibration_eval.py` exactly like
+  `stage1_eval.sbatch` does. It is submitted for both the `infer` and `cohort-infer`
+  subcommands; which annotations/output paths it runs against comes entirely from
+  `PIPE_ANNOTATIONS_CSV`, `PIPE_RESULTS_CSV`, `PIPE_MASKS_DIR`, `PIPE_DEPTH_DIR` (and optional
+  `PIPE_EXTRA` for `--limit`), which `pipeline.sh` exports before calling
+  `slurm/submit.sh pipeline_infer` — the job script hard-fails if any of them is unset, so it can
+  never silently run against a leftover value from a previous stage.
+- **`pipeline_export.sbatch`** — the CPU job, wraps `export_calibrated.py` the same way, via
+  `PIPE_CALIB_DIR`, `PIPE_OUT_DIR`, `PIPE_QC_FLAGS`, `PIPE_ANNOTATIONS_CSV`, `PIPE_MASKS_DIR`.
+
+`slurm/submit.sh` picks scheduler flags for both exactly as it does for `stage1_eval`/
+`stage3a_render`: `pipeline_infer` gets `SLURM_PARTITION_GPU`/`GPU_GRES`/`GPU_CPUS`/`GPU_MEM`/
+`TIME_STAGE1`, `pipeline_export` gets `SLURM_PARTITION_CPU`/`RENDER_CPUS`/`RENDER_MEM`/
+`TIME_RENDER` — nothing GPU/CPU-shape-specific to configure beyond `slurm/env.sh`'s existing
+scheduler block.
+
+**Resuming.** Every stage writes a sentinel to `$RUN_ROOT/.done/<stage>.ok` once it finishes;
+re-running `bash slurm/pipeline.sh all` (or any individual subcommand) skips stages whose
+sentinel already exists, so a wall-clock kill or a failed `check` only costs you the stage it
+interrupted. `--force` clears one *named* stage's sentinel and reruns just that stage — it does
+not cascade through `all`. `bash slurm/pipeline.sh status` prints a done/pending table for every
+stage under the current `RUN_NAME`.
+
+| `pipeline.sh` subcommand | wraps | legacy stage (this page / README.md's numbering) |
+|---|---|---|
+| `fps`, `qc` | `probe_video_fps.py`, `qc_annotations.py --fix` | Step 0 (README.md calibration walkthrough) |
+| `infer` | `pipeline_infer.sbatch` → `run_calibration_eval.py` | Stage 1, full corpus |
+| `calibrate` | `calibrate_depth.py` | Step/Stage 2 |
+| `export` | `pipeline_export.sbatch` → `export_calibrated.py` | -- (not stage-numbered) |
+| `score` | `score_masks.py` + `heuristic_verdicts.py` | Mask triage, Backend B |
+| `cohort` | `sample.py` | Stage 0 sample (Run order, above) |
+| `cohort-infer` | `pipeline_infer.sbatch` over the cohort | Stage 1 masks (`stage1_eval`) |
+| `prefilter` | `prefilter.py` | Stage 2 pre-filter |
+| `overlays` | `stage3a_render` → `render_overlays.py` | Stage 3a render |
+| `verdicts` | in-session subagent grading (stop point) | Stage 3b triage (replaces `triage.py`) |
+| `report` | `report.py goldset` / `summarise` (stop point) | Stage 5 report |
+| `review` | `make_review_bundle.py` (+ `apply_corrections.py`) | Stage 4 review + correct |
 
 ## Things that will bite you
 

@@ -70,6 +70,29 @@ The depth backend is selected with `--depth-model {pi3x,da3}` (default `pi3x`):
   Like Pi3X and the SA-FARI checkpoint, it's licensed CC BY-NC 4.0
   (non-commercial).
 
+## Running end-to-end
+
+Everything below — Stage 1 inference, per-video calibration, export, both mask-QA backends, and
+review — can be driven end-to-end by `slurm/pipeline.sh` instead of by hand, one sentinel file
+per stage under `$RUN_ROOT/.done/` making the whole thing resumable, with `RUN_NAME=<x>`
+isolating each run's artifacts under `$SCRATCH/runs/<x>`.
+
+```bash
+bash slurm/pipeline.sh setup    # one-time: install missing deps, warm the HF cache (login node, needs internet)
+bash slurm/pipeline.sh check    # verify data transfer, checkpoint, env imports, HF cache
+bash slurm/pipeline.sh all      # fps -> qc -> infer (GPU) -> calibrate -> export -> score
+bash slurm/pipeline.sh all --with-cohort   # additionally: the QA-pilot cohort funnel, in parallel on GPU
+bash slurm/pipeline.sh status   # what's done / pending for this RUN_NAME
+```
+
+Configuration lives in `slurm/env.sh`'s pipeline block (`RUN_NAME`, `DATA_ROOT`, `RUN_ROOT`,
+`ANNOTATIONS_CSV`, `MODEL_LABEL`, ...). The driver stops short of the human steps — `verdicts`
+grading, `report`'s gold labelling, and `review`'s laptop step — printing instructions there
+instead of automating them, since none of the three can be made non-interactive. Both mask-QA
+backends from [Mask QA — how the pieces fit](#mask-qa--how-the-pieces-fit) converge on the same
+verdicts CSV; `pipeline.sh`'s `score` stage produces Backend B's (`verdicts_heuristic.csv`)
+automatically, while Backend A still needs `--with-cohort` plus the manual `verdicts` stop-point.
+
 ## Running
 
 ```bash
