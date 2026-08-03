@@ -30,6 +30,8 @@ from scripts.mask_signals import (
     shape_stats,
 )
 from scripts.stations import parse_frame_name, parse_mask_name, site_of, station_of
+import scripts.sites
+import scripts.stations
 
 H, W = 120, 200
 
@@ -57,6 +59,12 @@ def test_station_of_without_underscore_is_identity():
 
 def test_site_of():
     assert site_of("pnt_pnt_p1_video_reference_Secteur_Taï_Tai20_08240007") == "pnt"
+
+
+def test_stations_site_of_is_sites_site_of():
+    # scripts/stations.py re-exports scripts/sites.py's site_of rather than redefining it, so
+    # existing callers (qc_annotations.py included) all resolve to the one implementation.
+    assert scripts.stations.site_of is scripts.sites.site_of
 
 
 def test_parse_names_roundtrip_and_reject():

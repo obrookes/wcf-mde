@@ -209,6 +209,24 @@ def test_append_decision_drops_unknown_fields():
         assert "rogue" not in path.read_text()
 
 
+def test_load_decisions_backcompat_haiku_verdict_column():
+    # corrections CSVs written before the haiku_verdict -> source_verdict rename still load,
+    # with their old column's value surfaced under the new name.
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "old_corrections.csv"
+        old_fields = ["key", "video_name", "frame_idx", "instance_idx", "haiku_verdict",
+                      "action", "box_x0", "box_y0", "box_x1", "box_y1", "notes", "decided_at"]
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=old_fields)
+            w.writeheader()
+            w.writerow({"key": "v|5|0", "video_name": "v", "frame_idx": "5",
+                        "instance_idx": "0", "haiku_verdict": "split", "action": "autofix",
+                        "box_x0": "", "box_y0": "", "box_x1": "", "box_y1": "", "notes": "",
+                        "decided_at": "2026-08-02T00:00:00+00:00"})
+        got = load_decisions(path)
+        assert got["v|5|0"]["source_verdict"] == "split"
+
+
 # --------------------------------------------------------------------------------------
 # autofix render panel
 # --------------------------------------------------------------------------------------
