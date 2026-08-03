@@ -10,8 +10,8 @@
 # scheduler  -- TODO: fill these in for your cluster (`sinfo -s`, `sacctmgr show assoc user=$USER`)
 # ---------------------------------------------------------------------------------------
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-}"            # TODO e.g. "phys-chimp-2026"; leave empty to omit
-SLURM_PARTITION_GPU="${SLURM_PARTITION_GPU:-gpu}"   # TODO partition with GPUs
-SLURM_PARTITION_CPU="${SLURM_PARTITION_CPU:-compute}"  # TODO CPU-only partition
+SLURM_PARTITION_GPU="${SLURM_PARTITION_GPU:-workq}"  # single-partition cluster: GPU and CPU jobs
+SLURM_PARTITION_CPU="${SLURM_PARTITION_CPU:-workq}"  # both land on workq
 SLURM_QOS="${SLURM_QOS:-}"                    # TODO optional QOS; leave empty to omit
 
 GPU_GRES="${GPU_GRES:-gpu:1}"                 # TODO e.g. "gpu:a100:1" if your site needs a type
@@ -27,15 +27,11 @@ TIME_STAGE1="${TIME_STAGE1:-08:00:00}"
 TIME_RENDER="${TIME_RENDER:-02:00:00}"
 
 # ---------------------------------------------------------------------------------------
-# environment  -- TODO: replace with however this cluster activates the dap-3_py3-11 env
+# environment
 # ---------------------------------------------------------------------------------------
 activate_env() {
-    # TODO uncomment / adjust the lines your site needs, e.g.:
-    # module purge
-    # module load cuda/12.6
-    # source "$(conda info --base)/etc/profile.d/conda.sh"
-    # conda activate dap-3_py3-11
-    :
+    source "$HOME/miniforge3/etc/profile.d/conda.sh"
+    conda activate wcf-pipe
 }
 
 # ---------------------------------------------------------------------------------------
@@ -51,8 +47,8 @@ SCRATCH_ROOT="${SCRATCH_ROOT:-${SCRATCH:-$HOME/scratch}}"
 # timeout until the wall clock expires. Compute nodes here have no outbound internet.
 export HF_HOME="${HF_HOME:-$SCRATCH_ROOT/hf}"
 
-SAM3_CHECKPOINT="${SAM3_CHECKPOINT:-/home/dl18206/projs/Unmarked-Anything/weights/sam3/safari_checkpoint_hf.pt}"
-DEPTH_MODEL="${DEPTH_MODEL:-pi3x}"
+SAM3_CHECKPOINT="${SAM3_CHECKPOINT:-/scratch/b6cn/obrookes.b6cn/safari_checkpoint_hf.pt}"
+DEPTH_MODEL="${DEPTH_MODEL:-da3}"
 
 # QA artifact locations, all relative to the repo root
 QA_DIR="${QA_DIR:-outputs/qa}"
@@ -61,3 +57,14 @@ QA_RESULTS="${QA_RESULTS:-$QA_DIR/results.csv}"
 QA_MASKS="${QA_MASKS:-$QA_DIR/masks}"
 QA_DEPTH="${QA_DEPTH:-$QA_DIR/depth}"
 QA_OVERLAYS="${QA_OVERLAYS:-$QA_DIR/overlays}"
+
+# ---------------------------------------------------------------------------------------
+# pipeline  -- slurm/pipeline.sh, the end-to-end driver (fps -> qc -> infer -> calibrate ->
+# export -> score -> [cohort funnel] -> review). Everything below is one run's identity and
+# is overridable per invocation, e.g. `RUN_NAME=full bash slurm/pipeline.sh status`.
+# ---------------------------------------------------------------------------------------
+RUN_NAME="${RUN_NAME:-smoke}"
+DATA_ROOT="${DATA_ROOT:-$SCRATCH_ROOT/data}"
+RUN_ROOT="${RUN_ROOT:-$SCRATCH_ROOT/runs/$RUN_NAME}"
+ANNOTATIONS_CSV="${ANNOTATIONS_CSV:-$DATA_ROOT/annotations_20260709_with_fps.csv}"
+MODEL_LABEL="${MODEL_LABEL:-heuristic-v1}"

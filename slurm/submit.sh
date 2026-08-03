@@ -3,10 +3,18 @@
 #
 #   bash slurm/submit.sh stage1_eval
 #   bash slurm/submit.sh stage3a_render
+#   bash slurm/submit.sh pipeline_infer
+#   bash slurm/submit.sh pipeline_export
 #
 # Anything after the job name is forwarded to sbatch, so one-offs don't need an env.sh edit:
 #
 #   bash slurm/submit.sh stage1_eval --time=12:00:00
+#
+# pipeline_infer/pipeline_export are slurm/pipeline.sh's driver stages -- one GPU job script,
+# one CPU job script, both reused across several driver subcommands (infer AND cohort-infer both
+# submit pipeline_infer, for instance). This script only ever picks scheduler flags (GPU vs CPU);
+# which input/output paths the job runs against comes from PIPE_* env vars pipeline.sh exports
+# before calling this -- see slurm/pipeline_infer.sbatch / slurm/pipeline_export.sbatch.
 #
 # Run from the repo root: SLURM sets SLURM_SUBMIT_DIR from the submitting directory, and the
 # job scripts use it to find the repo (the batch script itself is copied to the node's spool,
@@ -18,7 +26,8 @@ source "$REPO_ROOT/slurm/env.sh"
 
 JOB="${1:-}"
 if [[ -z "$JOB" ]]; then
-    echo "usage: bash slurm/submit.sh {stage1_eval|stage3a_render} [extra sbatch flags]" >&2
+    echo "usage: bash slurm/submit.sh {stage1_eval|stage3a_render|pipeline_infer|pipeline_export}" \
+         "[extra sbatch flags]" >&2
     exit 2
 fi
 shift
@@ -35,6 +44,17 @@ case "$JOB" in
         FLAGS=(--partition="$SLURM_PARTITION_CPU"
                --cpus-per-task="$RENDER_CPUS" --mem="$RENDER_MEM" --time="$TIME_RENDER")
         ;;
+    pipeline_infer)
+        # GPU driver stage (slurm/pipeline.sh's `infer` and `cohort-infer`): same flag shape as
+        # stage1_eval, since it wraps the same GPU-bound run_calibration_eval.py.
+        FLAGS=(--partition="$SLURM_PARTITION_GPU" --gres="$GPU_GRES"
+               --cpus-per-task="$GPU_CPUS" --mem="$GPU_MEM" --time="$TIME_STAGE1")
+        ;;
+    pipeline_export)
+        # CPU driver stage (slurm/pipeline.sh's `export`): same flag shape as stage3a_render.
+        FLAGS=(--partition="$SLURM_PARTITION_CPU"
+               --cpus-per-task="$RENDER_CPUS" --mem="$RENDER_MEM" --time="$TIME_RENDER")
+        ;;
     *)
         echo "unknown job: $JOB" >&2; exit 2 ;;
 esac
@@ -46,6 +66,8 @@ esac
 if [[ "$JOB" == "stage1_eval" ]]; then
     [[ -f "$REPO_ROOT/$QA_SAMPLE" ]] || {
         echo "missing $QA_SAMPLE -- run scripts/qa/sample.py on the login node first" >&2; exit 1; }
+fi
+if [[ "$JOB" == "stage1_eval" || "$JOB" == "pipeline_infer" ]]; then
     [[ -d "$HF_HOME" && -n "$(ls -A "$HF_HOME" 2>/dev/null)" ]] || {
         echo "HF_HOME ($HF_HOME) is empty -- run 'bash slurm/preflight.sh' on the LOGIN node" >&2
         echo "first, or the job will fail offline on the compute node." >&2; exit 1; }
