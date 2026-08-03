@@ -351,3 +351,100 @@ Unit tests (no GPU, data, torch, network or API key needed):
 ```bash
 for t in scripts/test_*.py scripts/qa/test_*.py; do python "$t"; done
 ```
+## Mask triage
+
+`scripts/score_masks.py` (CPU only) scores every predicted SAM-3 mask in an
+export directory and ranks a human review queue. It answers one question —
+**which masks are wrong and therefore need human time?** — from artifacts that
+are already on disk: no model forward pass, no GPU, no ground truth, and no new
+annotation. It's the cheap tier of a larger triage design; model-side signals
+(confidence, test-time-augmentation agreement) need a SAM-3 checkpoint on the
+machine and a re-run of inference, neither of which this step requires.
+
+```bash
+python scripts/score_masks.py \
+  --export-dir outputs/export --out-dir outputs/triage --workers 12
+```
+
+Over the 9,588-frame export (12,197 masks, 572 stations) this takes ~5 minutes
+on 12 workers and buckets 61.7% `auto_accept` / 38.3% `needs_review`.
+
+Three tables are written:
+
+| file | grain | contents |
+|---|---|---|
+| `mask_scores.csv` | one row per `(video_name, frame_idx, instance_idx)` | every signal as its own column, the named flags it tripped, a fused `triage_score`, and a bucket |
+| `frame_scores.csv` | one row per frame | the **exhaustivity** signal — whether a subject-sized piece of the scene changed with no mask over it |
+| `review_queue.csv` | | `mask_scores.csv` minus the accepted masks, ranked worst-first |
+
+Every flag is named and traceable to something visible, so an annotator can see
+*why* a mask surfaced rather than being handed an opaque score:
+
+| flag | fires on | rate |
+|---|---|---|
+| `fragmented` | second connected component ≥ 25% of the largest — mask spans two subjects or shattered | 19.9% |
+| `truncated` | ≥ 15% of the boundary on a frame edge | 15.3% |
+| `no_residual_support` | < 10% of the mask overlaps any scene change vs. the clip's background | 8.5% |
+| `holes` | enclosed background > 10% of mask area | 1.5% |
+| `weak_boundary` | boundary gradient below the frame's own mean — the outline isn't on an image edge | 1.5% |
+| `anomalous_area` | \|log-area z\| > 2.5 against the station's own area prior | 1.0% |
+| `sliver` / `thin` | compactness < 0.05, or < 30% of area survives a 3×3 erosion | 0.2% |
+| `tiny` / `engulfs_frame` / `is_banner` | degenerate: < 64 px, > 60% of frame, or mostly status bar | ~0% |
+
+Three properties of this imagery drive the implementation, and getting any of
+them wrong quietly breaks the signals:
+
+- **The burnt-in status banner** (`scripts/banner.py`) — a Bushnell strip across
+  the bottom ~20–24 of 404 rows. Left in, it makes every mask reaching the frame
+  bottom look truncated, inflates gradient statistics with hard-edged text, and
+  poisons the background model. Its height varies by camera model, so it's
+  detected per station from the fact that its pixels barely change across
+  frames; the per-row statistic is the **median** over columns, because the
+  ticking clock does change and would defeat a mean.
+- **Background scope is the clip, not the station** (`scripts/background.py`) —
+  a camera-reference folder collects clips from repeat visits months apart, so a
+  median across the whole station is a smear that matches no individual frame.
+  Measured over 40 clips, station-scope backgrounds give a median mask/residual
+  IoU of 0.05 against 0.27 for clip-scope. Clips too short for a trustworthy
+  median get *no* residual signal rather than a misleading one (`background_scope`
+  records which); that's 17% of masks here.
+- **Three photometric modes**, not two — daylight colour, monochrome IR, and a
+  rare magenta false-colour IR (~0.3% of frames). Their pixel statistics are
+  unrelated, so the mode is part of the background's grouping key.
+
+Mask quality and **exhaustivity are kept in separate tables on purpose**. They
+are different questions in different units, and fusing them would let a frame of
+immaculate masks hide a subject nobody segmented. The exhaustivity test is
+deliberately not "how much residual is unmasked" — that is ~50% in normal frames
+and flagged 43% of the corpus. It asks instead whether one *coherent,
+subject-sized* blob was missed (opened to drop the halo around correct masks and
+canopy speckle), sized against the frame's own median mask area. That fires on
+17.8% of frames and does catch genuine partial masks — though it also fires on
+wind-moved vegetation, and it is the weaker of the two checks.
+
+Check the ranking by eye with `scripts/triage_contact_sheet.py`, which renders a
+grid of masks with their flags printed on them:
+
+```bash
+# the worst of the queue
+python scripts/triage_contact_sheet.py --scores outputs/triage/mask_scores.csv \
+  --export-dir outputs/export --out outputs/triage/worst.png --top 24
+
+# a random audit of what would be auto-accepted
+python scripts/triage_contact_sheet.py --scores outputs/triage/mask_scores.csv \
+  --export-dir outputs/export --out outputs/triage/accept_audit.png \
+  --bucket auto_accept --sample 24 --seed 0
+```
+
+The accept-bucket audit is not optional decoration: accepted masks become
+training data, so uncorrected errors there are self-reinforcing while
+correction-based metrics keep looking healthy. It is the only instrument here
+that detects that.
+
+**The bucket boundaries are not calibrated.** Cutoffs are set from this corpus's
+own signal distributions so each flag fires on a tail rather than on the bulk;
+turning `auto_accept` into a claim about precision needs a labelled gold set,
+which doesn't exist yet. Until then the bucket is a sort order and the flag
+reasons are the product.
+
+Unit tests: `python scripts/test_mask_signals.py` (synthetic, no GPU/data).
