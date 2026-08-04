@@ -32,6 +32,11 @@ TIME_RENDER="${TIME_RENDER:-02:00:00}"
 activate_env() {
     source "$HOME/miniforge3/etc/profile.d/conda.sh"
     conda activate wcf-pipe
+    # Static ffmpeg/ffprobe build (probe_video_fps.py needs ffprobe; the cluster has none and
+    # conda-forge ffmpeg is not installed in the env). Harmless no-op if the dir is absent.
+    if [ -d "$SCRATCH_ROOT/tools/ffmpeg-7.0.2-arm64-static" ]; then
+        export PATH="$SCRATCH_ROOT/tools/ffmpeg-7.0.2-arm64-static:$PATH"
+    fi
 }
 
 # ---------------------------------------------------------------------------------------
