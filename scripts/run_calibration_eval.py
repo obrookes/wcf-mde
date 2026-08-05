@@ -474,6 +474,12 @@ OUTPUT_FIELDS = [
 def load_rows(csv_path: Path, limit: int | None) -> list[dict]:
     with open(csv_path, newline="") as f:
         rows = list(csv.DictReader(f))
+    # qc_annotations.py --fix blanks frame_idx on rows it cannot resolve (e.g. the video is not
+    # on disk), so a blank is "unprocessable", not malformed. Skip those before applying --limit.
+    n_blank = sum(1 for r in rows if r["frame_idx"].strip() == "")
+    if n_blank:
+        print(f"skipping {n_blank} rows with blank frame_idx (unresolvable in QC)")
+        rows = [r for r in rows if r["frame_idx"].strip() != ""]
     if limit is not None:
         rows = rows[:limit]
     for r in rows:
