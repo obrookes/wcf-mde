@@ -94,6 +94,19 @@ mark_done() {
     touch "$(sentinel_path "$1")"
 }
 
+# Runs a PIPE_*-driven stage job. Default: sbatch --wait via submit.sh. PIPE_SUBMIT=local
+# executes the .sbatch script in-place instead, for continuing a run from INSIDE an existing
+# SLURM allocation (the script's srun then uses that allocation) -- e.g. a --dependency
+# continuation job. Do not use local mode for the GPU stages unless the allocation has a GPU.
+submit_stage_job() {
+    local name="$1"
+    if [[ "${PIPE_SUBMIT:-sbatch}" == "local" ]]; then
+        bash "slurm/${name}.sbatch"
+    else
+        bash slurm/submit.sh "$name" --wait
+    fi
+}
+
 require_file() {
     local path="$1" msg="$2"
     [[ -f "$path" ]] || { echo "!! missing $path -- $msg" >&2; exit 1; }
@@ -328,7 +341,7 @@ cmd_infer() {
     (
         set -euo pipefail
         cd "$REPO_ROOT"
-        bash slurm/submit.sh pipeline_infer --wait
+        submit_stage_job pipeline_infer
     ) 2>&1 | tee "$LOG_DIR/infer.log"
     mark_done infer
 }
@@ -390,7 +403,7 @@ cmd_export() {
     (
         set -euo pipefail
         cd "$REPO_ROOT"
-        bash slurm/submit.sh pipeline_export --wait
+        submit_stage_job pipeline_export
     ) 2>&1 | tee "$LOG_DIR/export.log"
     mark_done export
 }
@@ -450,7 +463,7 @@ cmd_cohort_infer() {
     (
         set -euo pipefail
         cd "$REPO_ROOT"
-        bash slurm/submit.sh pipeline_infer --wait
+        submit_stage_job pipeline_infer
     ) 2>&1 | tee "$LOG_DIR/cohort-infer.log"
     mark_done cohort-infer
 }
