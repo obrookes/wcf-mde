@@ -203,6 +203,15 @@ output dirs to have matching file counts — that's expected, not a bug. The
 results CSV also carries the subject centroid (`center_x`, `center_y`,
 `center_y_norm`).
 
+Each `*_masks.json` is `{"distance_gt": <float|null>, "instances": [...]}` — the
+frame's ground-truth distance alongside one COCO-RLE entry per instance, ordered
+to match the CSV's `instance_idx`. `distance_gt` is *frame*-level (the
+annotations give one distance per frame, so co-detected instances share it), and
+it rides along when `export_calibrated.py --masks-dir` copies masks into an
+export bundle, which is what makes that bundle self-describing. Mask dirs
+written before this field existed are a bare JSON list; `scripts/masks.py` still
+reads them, reporting `distance_gt` as `None`, so old runs need no re-generating.
+
 **Step 1.5 — benchmark methods before writing anything** (optional, CPU only,
 no torch): `scripts/benchmark_calibration.py` sweeps `--method`/`--degree`/
 `--robust`/`--anchor`/`--align`/`--ref-frame-method` combinations in one

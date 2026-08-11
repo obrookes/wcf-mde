@@ -4,6 +4,7 @@ Run directly:  python scripts/test_alignment.py  (also pytest-compatible).
 No GPU / data / torch needed."""
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -17,7 +18,14 @@ from scripts.alignment import (
     pick_reference_frame,
     _ransac_affine,
 )
-from scripts.masks import decode_rle, encode_rle, load_instance_masks, save_instance_masks
+from scripts.masks import (
+    decode_rle,
+    encode_rle,
+    load_instance_masks,
+    load_mask_record,
+    mask_path,
+    save_instance_masks,
+)
 
 
 def test_pick_reference_frame_furthest():
@@ -133,6 +141,49 @@ def test_save_and_load_instance_masks_preserve_order_and_shape():
         np.testing.assert_array_equal(loaded[0]["mask"], m1)
         np.testing.assert_array_equal(loaded[1]["mask"], m2)
         assert loaded[0]["center_xy"] == (7, 7)
+
+
+def _one_instance():
+    m = np.zeros((20, 30), dtype=bool)
+    m[5:10, 5:10] = True
+    return [{"mask": m, "center_xy": (7, 7), "area_px": int(m.sum())}]
+
+
+def test_distance_gt_round_trips_and_is_frame_level():
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        save_instance_masks(d, "testvid", 42, _one_instance(), distance_gt=12.5)
+        rec = load_mask_record(d, "testvid", 42)
+        assert rec["distance_gt"] == 12.5
+        assert len(rec["instances"]) == 1
+        # one distance for the frame, not a key on each instance
+        assert "distance_gt" not in rec["instances"][0]
+
+
+def test_distance_gt_defaults_to_none():
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        save_instance_masks(d, "testvid", 42, _one_instance())
+        assert load_mask_record(d, "testvid", 42)["distance_gt"] is None
+
+
+def test_legacy_bare_list_mask_file_still_loads():
+    """Mask dirs written before distance_gt existed are a bare JSON list; they must keep
+    loading (with distance_gt None) rather than forcing a Stage-1 re-run."""
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        save_instance_masks(d, "testvid", 42, _one_instance(), distance_gt=9.0)
+        path = mask_path(d, "testvid", 42)
+        with open(path) as f:
+            new_payload = json.load(f)
+        with open(path, "w") as f:  # rewrite in the legacy instances-only shape
+            json.dump(new_payload["instances"], f)
+
+        rec = load_mask_record(d, "testvid", 42)
+        assert rec["distance_gt"] is None
+        assert len(rec["instances"]) == 1
+        assert rec["instances"][0]["center_xy"] == (7, 7)
+        assert len(load_instance_masks(d, "testvid", 42)) == 1
 
 
 def _run_all():

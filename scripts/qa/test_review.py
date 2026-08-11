@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.masks import load_instance_masks, save_instance_masks
+from scripts.masks import load_instance_masks, load_mask_record, save_instance_masks
 from scripts.qa.apply_corrections import APPLIED_FIELDS, apply_morph, write_applied
 from scripts.qa.make_review_bundle import stage_bundle
 from scripts.qa.review_server import (
@@ -297,7 +297,7 @@ def _seed_masks(masks_dir: Path, video: str, frame: int):
         {"mask": clean, "center_xy": (20, 20), "area_px": int(clean.sum())},
         {"mask": broken, "center_xy": (85, 65), "area_px": int(broken.sum())},
     ]
-    save_instance_masks(masks_dir, video, frame, instances)
+    save_instance_masks(masks_dir, video, frame, instances, distance_gt=17.25)
     return clean, broken
 
 
@@ -328,7 +328,10 @@ def test_apply_morph_end_to_end():
         assert fixed_row["area_before"] == int(broken.sum())
         assert Path(fixed_row["out_path"]).exists()
 
-        got = load_instance_masks(out_dir, "vid", 5)
+        fixed_rec = load_mask_record(out_dir, "vid", 5)
+        # a mask correction must not drop the frame's ground truth
+        assert fixed_rec["distance_gt"] == 17.25
+        got = fixed_rec["instances"]
         assert [g["instance_idx"] for g in got] == [0, 1]
         assert (got[0]["mask"] == clean).all()  # untouched sibling preserved
         fixed = got[1]["mask"]

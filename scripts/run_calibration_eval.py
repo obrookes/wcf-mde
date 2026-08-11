@@ -392,6 +392,7 @@ def process_frame(
     mask_dir: Path | None = None,
     mask_video_name: str | None = None,
     mask_frame_idx: int | None = None,
+    mask_distance_gt: float | None = None,
 ) -> list[dict]:
     if frame_bgr is None:
         results = [{"instance_idx": None, "status": "frame_decode_error", "mask_area_px": None,
@@ -412,7 +413,8 @@ def process_frame(
         return results
 
     if mask_dir is not None and instances:
-        save_instance_masks(mask_dir, mask_video_name, mask_frame_idx, instances)
+        save_instance_masks(mask_dir, mask_video_name, mask_frame_idx, instances,
+                            distance_gt=mask_distance_gt)
 
     if not instances:
         results = [{"instance_idx": None, "status": "empty_mask", "mask_area_px": 0,
@@ -624,22 +626,31 @@ def main() -> None:
                 save_depth_maps(args.save_depth_dir, rows[row_indices[0]]["video_name"], depth_by_idx)
 
             for frame_idx, frame_bgr in frames_buffer:
+                # a frame_idx can map to several annotation rows; they should agree on the
+                # distance, and the first is what both the overlay banner and the mask JSON
+                # record (--results-csv still carries every row's own distance_gt verbatim)
+                frame_row_indices = idx_to_row_indices[frame_idx]
+                first_row = rows[frame_row_indices[0]]
+                distance_gt = first_row["distance_gt"]
+                if len({rows[i]["distance_gt"] for i in frame_row_indices}) > 1:
+                    print(f"  !! {first_row['video_name']} frame {frame_idx}: annotation rows "
+                          f"disagree on distance; recording {distance_gt} for the frame")
+
                 overlay_path = overlay_meta = None
                 if args.overlay_dir is not None:
-                    first_row = rows[idx_to_row_indices[frame_idx][0]]
                     overlay_meta = {
                         "frame_idx": frame_idx,  # script-decoded index, not the CSV's
                         "video_name": first_row["video_name"],
-                        "distance_gt": first_row["distance_gt"],
+                        "distance_gt": distance_gt,
                     }
                     overlay_path = args.overlay_dir / f"{video_path.stem}_frame{frame_idx:06d}.png"
 
-                video_name = rows[idx_to_row_indices[frame_idx][0]]["video_name"]
                 frame_fields_list = process_frame(
                     sam3, frame_bgr, depth_by_idx.get(frame_idx),
                     args.sam3_prompt, device,
                     overlay_path=overlay_path, overlay_meta=overlay_meta,
-                    mask_dir=args.save_mask_dir, mask_video_name=video_name, mask_frame_idx=frame_idx,
+                    mask_dir=args.save_mask_dir, mask_video_name=first_row["video_name"],
+                    mask_frame_idx=frame_idx, mask_distance_gt=distance_gt,
                 )
                 for i in idx_to_row_indices[frame_idx]:
                     for fields in frame_fields_list:

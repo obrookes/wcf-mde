@@ -35,7 +35,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.masks import load_instance_masks, mask_path, save_instance_masks  # noqa: E402
+from scripts.masks import load_mask_record, mask_path, save_instance_masks  # noqa: E402
 from scripts.qa.review_server import autofix_mask, load_decisions  # noqa: E402
 
 APPLIED_FIELDS = [
@@ -70,7 +70,8 @@ def apply_morph(decisions: dict[str, dict], masks_dir: Path,
 
         video_name, frame_idx = d["video_name"], int(d["frame_idx"])
         try:
-            instances = load_instance_masks(masks_dir, video_name, frame_idx)
+            record = load_mask_record(masks_dir, video_name, frame_idx)
+            instances = record["instances"]
         except (FileNotFoundError, OSError) as exc:
             rows.append({**base, "disposition": "errored", "error": str(exc)})
             continue
@@ -92,8 +93,10 @@ def apply_morph(decisions: dict[str, dict], masks_dir: Path,
         inst["center_xy"] = (int((xs.min() + xs.max()) // 2),
                              int((ys.min() + ys.max()) // 2))
         # instances were saved (and load in) position-ordered, so re-saving the full list
-        # preserves every instance_idx, including untouched siblings
-        save_instance_masks(out_masks_dir, video_name, frame_idx, instances)
+        # preserves every instance_idx, including untouched siblings. distance_gt is carried
+        # over from the source file: a correction retouches the mask, not the ground truth
+        save_instance_masks(out_masks_dir, video_name, frame_idx, instances,
+                            distance_gt=record["distance_gt"])
         rows.append({**base, "disposition": "corrected",
                      "area_before": int(before.sum()), "area_after": int(after.sum()),
                      "out_path": str(mask_path(out_masks_dir, video_name, frame_idx))})
